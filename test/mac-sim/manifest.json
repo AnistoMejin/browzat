@@ -1,0 +1,9 @@
+{
+  "manifest_version": 2,
+  "name": "Containers add-on simulator (test only)",
+  "version": "1.0",
+  "description": "Mimics Multi-Account Containers' always-open-in-container behaviour for the Browser MCP tests.",
+  "permissions": ["tabs", "cookies", "contextualIdentities", "webRequest", "webRequestBlocking", "<all_urls>"],
+  "background": { "scripts": ["background.js"] },
+  "browser_specific_settings": { "gecko": { "id": "mac-sim@local" } }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "browser-mcp",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local MCP server and browser extension that drive the user's own logged-in Chrome, Edge and Firefox profiles.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node extension/build.js",
+    "start": "node server/cli.js start",
+    "status": "node server/cli.js status",
+    "pair": "node server/cli.js pair",
+    "reload": "node server/cli.js reload all",
+    "stop": "node server/cli.js stop"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
