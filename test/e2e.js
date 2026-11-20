@@ -92,7 +92,7 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
     const init = await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
     mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
     const tools = await request('tools/list', {});
-    check('MCP handshake and tool list', init.result.serverInfo.name === 'browser-mcp' && tools.result.tools.length === 10, JSON.stringify(init.result));
+    check('MCP handshake and tool list', init.result.serverInfo.name === 'browser-mcp' && tools.result.tools.length === 11, JSON.stringify(init.result));
 
     let r = await call('status', {});
     check(`status lists ${browser}`, new RegExp('^' + browser + '\\b', 'm').test(r.text), r.text);
@@ -200,6 +200,39 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
         check('follows a navigation that the containers add-on moves to a container', !!ntab && ntab !== tab && /container: Work/.test(r.text) && /reopened/.test(r.text), r.text);
         if (ntab && ntab !== tab) await call('tabs', { action: 'close', tab: ntab });
       }
+    }
+
+    // Handoff. Nobody clicks here, so this covers the card, its isolation, navigation, timeout and tab close.
+    {
+      const cardThere = async (t) => {
+        const e = await call('evaluate', {
+          tab: t,
+          code: "[...document.body.children].some((x) => x.tagName === 'DIV' && x.style.zIndex === '2147483647')",
+        });
+        return e.text.trim();
+      };
+      r = await call('tabs', { action: 'new', browser, url: base + '/form' });
+      const htab = (/^tab: (\S+)/m.exec(r.text) || [])[1];
+      const waiting = call('handoff', { tab: htab, message: 'E2E test: nobody needs to click this.', timeout_s: 10 });
+      await new Promise((res) => setTimeout(res, 2000));
+      check('handoff shows a card in the page', (await cardThere(htab)) === 'true', 'card not found');
+      const inner = await call('evaluate', {
+        tab: htab,
+        code: "const h = [...document.body.children].find((x) => x.style.zIndex === '2147483647'); return h ? String(h.shadowRoot) : 'no host';",
+      });
+      check('the page cannot reach into the card (closed shadow root)', inner.text.trim() === 'null', inner.text);
+      r = await waiting;
+      check('handoff times out when nobody answers', r.isError && /nobody answered/.test(r.text), r.text);
+      check('the card is removed after the handoff', (await cardThere(htab)) === 'false', 'card still there');
+
+      const closing = call('handoff', { tab: htab, message: 'E2E test: the tab will move, then close.', timeout_s: 60 });
+      await new Promise((res) => setTimeout(res, 1500));
+      await call('navigate', { tab: htab, url: base + '/second' });
+      await new Promise((res) => setTimeout(res, 1500));
+      check('the card comes back after the page navigates', (await cardThere(htab)) === 'true', 'card not found on the new page');
+      await call('tabs', { action: 'close', tab: htab });
+      r = await closing;
+      check('closing the tab ends the handoff', r.isError && /tab was closed/.test(r.text), r.text);
     }
 
     r = await call('tabs', { action: 'list', browser });

@@ -462,3 +462,68 @@ async function bmcpEval(code) {
     return { ok: false, error: String(e) };
   }
 }
+
+// Shows (or removes) the handoff card: a small panel asking the user to do something only a person can do, with
+// Continue and Cancel. Styles are set through the CSSOM inside a closed shadow root, so the page's CSS cannot reach it
+// and a strict style-src policy does not block it. Only a real click (isTrusted) counts, so neither the page nor the
+// agent's synthetic click tool can answer for the user.
+function bmcpHandoffCard(o) {
+  try {
+    const api = globalThis.browser || globalThis.chrome;
+    const KEY = '__bmcpHandoff';
+    const old = globalThis[KEY];
+    if (o.ensure && old && old.id === o.id && old.host.isConnected) return { ok: true, value: 'present' };
+    if (old && old.host && old.host.isConnected) old.host.remove();
+    globalThis[KEY] = null;
+    if (o.remove) return { ok: true, value: 'removed' };
+
+    const css = (el, s) => { for (const k in s) el.style.setProperty(k, s[k], 'important'); return el; };
+    const make = (tag, s, text) => { const el = css(document.createElement(tag), s); if (text != null) el.textContent = text; return el; };
+
+    const host = document.createElement('div');
+    css(host, { all: 'initial', position: 'fixed', right: '18px', bottom: '18px', 'z-index': '2147483647', display: 'block' });
+    const root = host.attachShadow({ mode: 'closed' });
+    const font = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+    const card = make('div', {
+      width: '340px', 'box-sizing': 'border-box', padding: '14px 16px', 'border-radius': '10px',
+      background: '#0d1117', color: '#e6edf3', border: '1px solid #3fb950', 'box-shadow': '0 8px 28px rgba(0,0,0,.45)',
+      'font-family': font, 'font-size': '14px', 'line-height': '1.45', 'text-align': 'left',
+    });
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-label', 'Action needed from you');
+    card.appendChild(make('div', { 'font-weight': '600', 'font-size': '13px', color: '#3fb950', margin: '0 0 6px' }, 'browzat · your AI agent is waiting for you'));
+    card.appendChild(make('div', { 'white-space': 'pre-wrap', margin: '0 0 8px', 'font-family': font }, String(o.message || '')));
+    card.appendChild(make('div', { 'font-size': '12px', color: '#8b949e', margin: '0 0 12px', 'word-break': 'break-all', 'font-family': font }, 'Site: ' + (o.origin || location.origin)));
+
+    const row = make('div', { display: 'flex', gap: '8px', 'justify-content': 'flex-end' });
+    const btn = (label, primary) => make('button', {
+      cursor: 'pointer', padding: '6px 14px', 'border-radius': '6px', 'font-family': font, 'font-size': '13px', 'font-weight': '600',
+      border: primary ? '1px solid #3fb950' : '1px solid #30363d', background: primary ? '#238636' : '#21262d', color: '#ffffff',
+    }, label);
+    const cancel = btn('Cancel', false);
+    const go = btn('Continue', true);
+    row.appendChild(cancel);
+    row.appendChild(go);
+    card.appendChild(row);
+    root.appendChild(card);
+
+    const answer = (decision) => (ev) => {
+      if (!ev.isTrusted) return; // ignore scripted clicks
+      ev.preventDefault();
+      ev.stopPropagation();
+      go.disabled = true;
+      cancel.disabled = true;
+      Promise.resolve(api.runtime.sendMessage({ type: 'bmcp-handoff-done', id: o.id, decision }))
+        .catch(() => {})
+        .then(() => { if (host.isConnected) host.remove(); });
+    };
+    go.addEventListener('click', answer('continue'));
+    cancel.addEventListener('click', answer('cancel'));
+
+    (document.body || document.documentElement).appendChild(host);
+    globalThis[KEY] = { id: o.id, host };
+    return { ok: true, value: 'shown' };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}

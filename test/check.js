@@ -35,6 +35,11 @@ const rel = (p) => path.relative(root, p).replace(/\\/g, '/');
 for (const f of files.filter((f) => f.endsWith('.js'))) {
   check(`syntax  ${rel(f)}`, () => execFileSync(process.execPath, ['--check', f], { stdio: 'pipe' }));
 }
+for (const f of files.filter((f) => /\.(js|json|md|html|ps1|sh|yml)$/.test(f))) {
+  // A UTF-8 byte-order mark (Windows PowerShell 5.1 adds one) breaks npm and shell scripts.
+  const b = fs.readFileSync(f);
+  if (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) check(`no BOM  ${rel(f)}`, () => { throw new Error('file starts with a UTF-8 BOM'); });
+}
 for (const f of files.filter((f) => f.endsWith('.json'))) {
   check(`json    ${rel(f)}`, () => JSON.parse(fs.readFileSync(f, 'utf8')));
 }

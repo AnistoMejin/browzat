@@ -1,12 +1,15 @@
+<p align="center"><img src="assets/logo.svg" width="96" height="96" alt="browzat logo"></p>
+
 # browzat
 
 Lets an AI agent (Claude Code or any other MCP client) drive **your own, logged-in browser profiles** in
 Chrome, Edge and Firefox. Nothing is launched in a clean profile: the agent works in the browser you already
 use, with your sessions, and you can watch it.
 
-The project is published as **browzat**. Inside the code it still uses its working name **Browser MCP**
-(`browser-mcp`), so the folders, the MCP entry, the extension name and the environment variables keep that name.
-The table below maps one to the other.
+The project is published as **browzat**, and the extension shows that name and logo in the browser. Inside the code
+it still uses its working name **Browser MCP** (`browser-mcp`): the folders, the MCP entry, the Firefox add-on id and
+the environment variables keep that name, so existing installs and pairings keep working. The table below maps one
+to the other.
 
 ## Names and locations
 
@@ -18,7 +21,8 @@ The table below maps one to the other.
 | Data folder (pairing token, `relay.log`, screenshots) | `~/.browser-mcp` (`%USERPROFILE%\.browser-mcp` on Windows) |
 | MCP server name in Claude Code | `browser-mcp` (user level); tools appear as `mcp__browser-mcp__<tool>` |
 | npm package name | `browser-mcp` (`package.json`, private, not published) |
-| Extension name in the browser | **Browser MCP Bridge**; Firefox add-on id `browser-mcp-bridge@local` |
+| Extension name in the browser | **browzat** (was Browser MCP Bridge before 0.3.0); Firefox add-on id `browser-mcp-bridge@local` |
+| Logo | `assets/logo.svg`; icons in `extension/icons/`, drawn by `assets/make-icons.py` |
 | Relay address | `127.0.0.1:19789` |
 | Environment variables | `BROWSER_MCP_PORT`, `BROWSER_MCP_HOME`, `BROWSER_MCP_TZ` |
 
@@ -38,6 +42,11 @@ browzat/                         (source folder; the repository root)
 ├── .gitattributes               line endings: LF for install.sh, CRLF for install.ps1
 ├── .editorconfig                editor settings: UTF-8, 2-space indent, final newline
 ├── .github/workflows/ci.yml     CI: npm run check on Linux and Windows, Node 20 and 22
+├── assets/
+│   ├── logo.svg                 the browzat logo (README, GitHub)
+│   ├── logo-256.png             the same as PNG
+│   └── make-icons.py            draws the logo and the extension icons (Python + Pillow)
+├── docs/research/               competitor landscape and the reference map of where others implement what
 ├── install.ps1                  Windows installer: copy → npm install → build → register MCP → restart relay → reload extensions
 ├── install.sh                   the same for Linux (not yet run on a real Linux machine)
 │
@@ -52,6 +61,7 @@ browzat/                         (source folder; the repository root)
 │   ├── build.js                 builds dist/chromium (Manifest V3) and dist/firefox (Manifest V2)
 │   ├── manifest.chromium.json   manifest template for Chrome and Edge
 │   ├── manifest.firefox.json    manifest template for Firefox (adds containers and cookies permissions)
+│   ├── icons/                   toolbar icons, 16 / 32 / 48 / 128 px
 │   └── src/
 │       ├── core.js              background logic: connect to the relay, pairing, run the tools it sends
 │       ├── page.js              functions injected into web pages: snapshot, click, type, keys, wait
@@ -162,7 +172,7 @@ Pairing is needed once per browser profile.
 ### Give each profile a name
 
 Two profiles of the same browser get the names `chrome` and `chrome-2` in the order they connect, so the names
-can swap after a restart. Click the Browser MCP Bridge icon in each profile, type a name such as `chrome-work`, and
+can swap after a restart. Click the browzat icon in each profile, type a name such as `chrome-work`, and
 press **Save and connect**. The name then stays with that profile.
 
 ## Tools
@@ -179,6 +189,13 @@ press **Save and connect**. The name then stays with that profile.
 | `evaluate` | Run JavaScript in the page |
 | `wait_for` | Wait for text or a selector to appear or disappear |
 | `screenshot` | Capture the visible part of a tab |
+| `handoff` | Ask the user to do a step only a person can do (login, 2FA, passkey, captcha, a confirmation), then wait |
+
+**Handoff:** the tab comes to the front with a small card that shows the agent's message, the site, and **Continue**
+and **Cancel**. The tool returns when you click one of them, when the tab closes, or after `timeout_s` (default 300,
+at most 600). Only a real click counts: the page and the agent's own `click` tool cannot answer for you. The card
+comes back if the page navigates (a login redirect, for example). While a handoff is open the toolbar icon shows `?`;
+its popup lists open handoffs with the same two buttons, for pages where the card cannot be shown.
 
 Tab handles look like `firefox:12`. The agent sees only the tabs it opened unless it asks for all tabs, and it
 refuses to close a tab it did not open unless told to force it. Password field values are never included in a snapshot.

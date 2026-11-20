@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs or updates Browser MCP on Linux. Safe to run again after every change or git pull.
+# Installs or updates browzat (Browser MCP) on Linux. Safe to run again after every change or git pull.
 #   ./install.sh [--dir <folder>] [--pair] [--no-claude]
 # It copies the files to the install folder, installs the one dependency, builds the extension, registers the
 # MCP server in Claude Code, restarts the relay and tells already-loaded extensions to reload themselves.

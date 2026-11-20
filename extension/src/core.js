@@ -15,6 +15,8 @@ let relayId = '';
 let connecting = false;
 let retryTimer = null;
 let lastPairCode = '';
+// Open handoffs, by tab id: { hid, message, start, timer, resolve, shown }.
+const handoffs = new Map();
 
 function detectKind() {
   if (IS_FIREFOX) return 'firefox';
@@ -41,6 +43,12 @@ async function hmacHex(tokenHex, msg) {
 function setStatus(s) {
   linkState = s;
   try {
+    if (handoffs.size) {
+      // A handoff is waiting for the user: say so on the toolbar icon whatever the link state is.
+      badge.setBadgeText({ text: '?' });
+      badge.setBadgeBackgroundColor({ color: '#b26a00' });
+      return;
+    }
     badge.setBadgeText({ text: s === 'connected' ? 'on' : s === 'badtoken' ? '!' : '' });
     badge.setBadgeBackgroundColor({ color: s === 'connected' ? '#0a7d33' : '#b3261e' });
   } catch (e) {}
@@ -142,8 +150,40 @@ async function saveAgentTabs() {
 }
 
 api.tabs.onRemoved.addListener(async (id) => {
+  finishHandoff(id, 'closed', true);
   const s = await getAgentTabs();
   if (s.delete(id)) saveAgentTabs();
+});
+
+// ---- handoff: the agent waits while the user does something only a person can do ----
+
+function originOf(url) {
+  try { return new URL(url).origin; } catch (e) { return String(url || ''); }
+}
+
+async function showHandoffCard(tabId, ensure) {
+  const h = handoffs.get(tabId);
+  if (!h) return false;
+  const tab = await api.tabs.get(tabId);
+  const res = await run(tabId, bmcpHandoffCard, [{ id: h.hid, message: h.message, origin: originOf(tab.url), ensure: !!ensure }], { frameId: 0 });
+  unwrap(res[0]);
+  h.shown = true;
+  return true;
+}
+
+function finishHandoff(tabId, decision, tabGone, via) {
+  const h = handoffs.get(tabId);
+  if (!h) return;
+  handoffs.delete(tabId);
+  clearTimeout(h.timer);
+  setStatus(linkState);
+  if (!tabGone) run(tabId, bmcpHandoffCard, [{ remove: true }], { frameId: 0 }).catch(() => {});
+  h.resolve({ decision, via: via || '' });
+}
+
+// The page may navigate during the handoff (a login redirect, for example): put the card back on each new page.
+api.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status === 'complete' && handoffs.has(tabId)) showHandoffCard(tabId, true).catch(() => {});
 });
 
 // ---- helpers ----
@@ -522,6 +562,41 @@ const handlers = {
   },
 };
 
+handlers.handoff = async (p) => {
+  const id = need(p);
+  const message = String(p.message || '').trim().slice(0, 600) || 'Please finish this step in the page, then click Continue.';
+  const timeoutMs = clamp((Number(p.timeout_s) || 300) * 1000, 10000, 600000);
+  finishHandoff(id, 'replaced');
+
+  // Bring the tab and its window to the front: the user has to act there.
+  const tab = await api.tabs.update(id, { active: true });
+  try { await api.windows.update(tab.windowId, { focused: true }); } catch (e) {}
+
+  const start = Date.now();
+  const decided = new Promise((resolve) => {
+    handoffs.set(id, {
+      hid: randHex(12), message, start, resolve, shown: false,
+      timer: setTimeout(() => finishHandoff(id, 'timeout'), timeoutMs),
+    });
+  });
+  setStatus(linkState);
+
+  let cardError = '';
+  try { await showHandoffCard(id, false); } catch (e) { cardError = String((e && e.message) || e); }
+
+  const { decision, via } = await decided;
+  let after = null;
+  try { after = await api.tabs.get(id); } catch (e) {}
+  return {
+    decision,
+    via,
+    ms: Date.now() - start,
+    url: after ? after.url : '',
+    title: after ? after.title : '',
+    cardError,
+  };
+};
+
 // Internal (not an MCP tool): reloads this extension from disk so new code is picked up without a click.
 handlers._reload = async () => {
   setTimeout(() => api.runtime.reload(), 300);
@@ -581,6 +656,28 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'bmcp-reconnect') {
     reconnect().then(() => sendResponse({ ok: true }));
     return true;
+  }
+  if (msg.type === 'bmcp-handoffs') {
+    // For the popup: the open handoffs, with the tab title to recognise them.
+    Promise.all([...handoffs.entries()].map(async ([tabId, h]) => {
+      let title = '';
+      try { title = (await api.tabs.get(tabId)).title || ''; } catch (e) {}
+      return { tabId, message: h.message, title, since: h.start };
+    })).then((list) => sendResponse({ handoffs: list }));
+    return true;
+  }
+  if (msg.type === 'bmcp-handoff-done') {
+    const decision = msg.decision === 'continue' ? 'continue' : 'cancel';
+    if (sender.tab) {
+      // From the card in the page: it must name the handoff that is open in that same tab.
+      const h = handoffs.get(sender.tab.id);
+      if (h && msg.id === h.hid) finishHandoff(sender.tab.id, decision, false, 'card');
+    } else if (typeof msg.tabId === 'number' && handoffs.has(msg.tabId)) {
+      // From the popup, an extension page.
+      finishHandoff(msg.tabId, decision, false, 'popup');
+    }
+    sendResponse({ ok: true });
+    return undefined;
   }
   return undefined;
 });

@@ -1,4 +1,4 @@
-# Installs or updates Browser MCP on Windows. Safe to run again after every change or git pull.
+# Installs or updates browzat (Browser MCP) on Windows. Safe to run again after every change or git pull.
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Dir <folder>] [-Pair] [-NoClaude]
 # It copies the files to the install folder, installs the one dependency, builds the extension, registers the
 # MCP server in Claude Code, restarts the relay and tells already-loaded extensions to reload themselves.

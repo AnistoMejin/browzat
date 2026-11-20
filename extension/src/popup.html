@@ -4,7 +4,10 @@
 <meta charset="utf-8">
 <style>
   body { font: 13px system-ui, sans-serif; width: 290px; margin: 12px; }
-  h3 { margin: 0 0 8px; font-size: 15px; }
+  header { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
+  header img { width: 28px; height: 28px; }
+  h3 { margin: 0; font-size: 16px; line-height: 1.1; }
+  header small { display: block; color: #666; font-size: 11px; }
   #st { margin: 0 0 10px; padding: 6px 8px; border-radius: 6px; background: #f1f1f1; }
   #st.ok { background: #e3f4e8; color: #0a5c26; }
   #st.bad { background: #fbe9e7; color: #8c1d18; }
@@ -13,11 +16,20 @@
   .row { display: flex; gap: 8px; margin-top: 12px; }
   button { flex: 1; padding: 6px; }
   p.hint { color: #555; margin: 10px 0 0; font-size: 12px; }
+  .ho { margin: 0 0 10px; padding: 8px; border-radius: 6px; background: #fff4e0; border: 1px solid #e0a040; }
+  .ho b { display: block; margin-bottom: 4px; }
+  .ho .msg { white-space: pre-wrap; margin-bottom: 4px; }
+  .ho .tab { color: #555; font-size: 12px; margin-bottom: 6px; word-break: break-all; }
+  .ho .row { margin-top: 6px; }
 </style>
 </head>
 <body>
-<h3>Browser MCP</h3>
+<header>
+  <img src="icons/icon-32.png" alt="">
+  <div><h3>browzat</h3><small>your AI agent in your own browser</small></div>
+</header>
 <div id="st">Checking…</div>
+<div id="handoffs"></div>
 <label for="name">Name of this browser (optional)</label>
 <input id="name" placeholder="for example firefox, chrome-work">
 <label for="port">Relay port</label>

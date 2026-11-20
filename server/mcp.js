@@ -129,13 +129,32 @@ const TOOLS = [
       required: ['tab'],
     },
   },
+  {
+    name: 'handoff',
+    description:
+      'Ask the user to do something only a person can do in a tab (log in, 2FA, passkey, captcha, payment or delete ' +
+      'confirmation, a click the site refuses from the agent), then wait. The tab comes to the front with a card showing ' +
+      'your message and Continue / Cancel. Returns when the user answers, the tab closes, or timeout_s passes. ' +
+      'Never solve a captcha yourself; hand off instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        message: { type: 'string', description: 'What the user should do, in one or two short sentences.' },
+        timeout_s: { type: 'number', description: 'How long to wait. Default 300, maximum 600.' },
+      },
+      required: ['tab', 'message'],
+    },
+  },
 ];
 const TOOL_NAMES = new Set(TOOLS.map((t) => t.name));
 
 const INSTRUCTIONS =
-  "Drives the user's own logged-in Firefox, Chrome and Edge through the Browser MCP extension. " +
+  "Drives the user's own logged-in Firefox, Chrome and Edge through the browzat extension. " +
   'Open a tab with tabs (action new), read it with snapshot, then act on refs like e12 with click and type. ' +
-  'Work only in tabs you opened unless the user asks for one of theirs.';
+  'Work only in tabs you opened unless the user asks for one of theirs. ' +
+  'When only a person can proceed (login, 2FA, passkey, captcha, a confirmation the site will not accept from you), ' +
+  'call handoff with a short instruction and wait, instead of asking in chat or retrying.';
 
 const text = (t) => ({ content: [{ type: 'text', text: String(t) }] });
 const handle = (browser, id) => `${browser}:${id}`;
@@ -165,7 +184,7 @@ async function relayCall(method, params, timeoutMs) {
 function fmtStatus(s) {
   const lines = [`relay ${s.version} on 127.0.0.1:${s.port}`];
   if (!s.browsers.length) {
-    lines.push('no browser is connected. The browser must be running with the Browser MCP extension installed and paired.');
+    lines.push('no browser is connected. The browser must be running with the browzat extension installed and paired.');
   } else {
     for (const b of s.browsers) lines.push(`${b.id}  (${b.kind}, extension ${b.extension || '?'})`);
   }
@@ -208,7 +227,9 @@ async function runTool(name, a) {
     throw new Error('tab is required');
   }
 
-  const wait = Math.min(Math.max(Number(a.timeout_ms || a.time_ms) || 30000, 1000), 120000);
+  const wait = name === 'handoff'
+    ? Math.min(Math.max((Number(a.timeout_s) || 300) * 1000, 10000), 600000)
+    : Math.min(Math.max(Number(a.timeout_ms || a.time_ms) || 30000, 1000), 120000);
   const out = await relayCall('call', { browser, tool: name, args, timeoutMs: wait + 15000 }, wait + 60000);
   const b = out.browser;
   const r = out.result || {};
@@ -257,6 +278,20 @@ async function runTool(name, a) {
           },
         ],
       };
+    }
+    case 'handoff': {
+      const secs = Math.round((r.ms || 0) / 1000);
+      const where = `\nurl now: ${r.url || ''}\ntitle: ${r.title || ''}`;
+      const card = r.cardError ? `\nnote: the in-page card could not be shown (${r.cardError}); the user answered from the extension's toolbar popup` : '';
+      const via = r.via ? ` (in the ${r.via === 'popup' ? "toolbar popup" : 'card on the page'})` : '';
+      if (r.decision === 'continue') return text(`the user clicked Continue${via} after ${secs} s${where}${card}`);
+      const why = {
+        cancel: `the user clicked Cancel${via}`,
+        timeout: `nobody answered within ${secs} s`,
+        closed: 'the tab was closed',
+        replaced: 'a newer handoff replaced this one',
+      }[r.decision] || `handoff ended: ${r.decision}`;
+      return { content: [{ type: 'text', text: `${why}. Do not continue this step; tell the user.${where}${card}` }], isError: true };
     }
     default:
       return text(JSON.stringify(r));

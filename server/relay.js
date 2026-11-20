@@ -57,8 +57,8 @@ function validCode(code) {
 
 function pairPage(code) {
   const valid = !!validCode(code);
-  const head = '<!doctype html><html><head><meta charset="utf-8"><title>Browser MCP pairing</title>' +
-    '<style>body{font:16px system-ui;margin:48px;max-width:600px}.ok{color:#0a7d33}.bad{color:#b3261e}</style></head><body><h2>Browser MCP pairing</h2>';
+  const head = '<!doctype html><html><head><meta charset="utf-8"><title>browzat pairing</title>' +
+    '<style>body{font:16px system-ui;margin:48px;max-width:600px}.ok{color:#0a7d33}.bad{color:#b3261e}</style></head><body><h2>browzat pairing</h2>';
   if (!valid) return head + '<p class="bad">This pairing link has expired or is not valid. Ask for a new one.</p></body></html>';
   const script = `
 const code = ${JSON.stringify(code)};
@@ -72,12 +72,12 @@ async function tick() {
     if (!j.valid) { m.textContent = 'This pairing link has expired.'; m.className = 'bad'; return; }
     const mine = j.redeemed.filter((x) => x.kind === kind || (kind === 'chrome' && /chrom|brave|opera/.test(x.kind)));
     if (mine.length) { m.textContent = 'Paired with this browser (' + (mine[0].name || mine[0].kind) + '). You can close this tab.'; m.className = 'ok'; return; }
-    if (Date.now() - t0 > 6000) m.textContent = 'Still waiting. If nothing happens, the Browser MCP extension is not installed or not enabled in this browser.';
+    if (Date.now() - t0 > 6000) m.textContent = 'Still waiting. If nothing happens, the browzat extension is not installed or not enabled in this browser.';
   } catch (e) {}
   setTimeout(tick, 1000);
 }
 tick();`;
-  return head + '<p id="m">Waiting for the Browser MCP extension in this browser…</p><script>' + script + '</script></body></html>';
+  return head + '<p id="m">Waiting for the browzat extension in this browser…</p><script>' + script + '</script></body></html>';
 }
 
 function statusObj() {
@@ -118,14 +118,15 @@ async function resolveBrowser(name) {
   const have = [...browsers.keys()].join(', ') || 'none';
   throw new Error(
     (name ? `browser "${name}" is not connected` : 'no browser is connected') +
-    ` (connected: ${have}). The browser must be running with the Browser MCP extension installed and paired.`
+    ` (connected: ${have}). The browser must be running with the browzat extension installed and paired.`
   );
 }
 
 async function callBrowser(p) {
   const b = await resolveBrowser(p.browser);
   const id = seq++;
-  const ms = Math.min(Math.max(Number(p.timeoutMs) || 45000, 1000), 180000);
+  // Up to 11 minutes: a handoff may wait 10 minutes for the user; other tools ask for much less.
+  const ms = Math.min(Math.max(Number(p.timeoutMs) || 45000, 1000), 660000);
   const result = await new Promise((resolve, reject) => {
     const t = setTimeout(() => {
       b.pending.delete(id);
