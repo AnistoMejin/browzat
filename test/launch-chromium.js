@@ -15,6 +15,9 @@ const child = spawn(exe, [
   '--disable-features=DisableLoadExtensionCommandLineSwitch',
   `--load-extension=${extDir}`,
   `--remote-debugging-port=${PORT}`,
+  // Extra flags, for example CHROME_EXTRA_ARGS=--no-sandbox for a test build on Ubuntu 23.10+, where AppArmor
+  // blocks the sandbox of browsers that are not installed as system packages. Throwaway test profiles only.
+  ...String(process.env.CHROME_EXTRA_ARGS || '').split(/\s+/).filter(Boolean),
   'about:blank',
 ], { stdio: 'ignore' });
 child.on('exit', (c) => { console.log('browser exited ' + c); process.exit(0); });

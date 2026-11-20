@@ -63,10 +63,16 @@ const TOOLS = [
   },
   {
     name: 'click',
-    description: 'Click an element by snapshot ref or CSS selector. Reports the new URL if the page navigated.',
+    description: 'Click an element by snapshot ref or CSS selector. Chrome and Edge use real mouse input (pages trust it); Firefox simulates it. Reports the new URL if the page navigated, and any alert/confirm/prompt the click caused.',
     inputSchema: {
       type: 'object',
-      properties: { tab: TAB, ref: { type: 'string' }, selector: { type: 'string' }, double: { type: 'boolean' } },
+      properties: {
+        tab: TAB,
+        ref: { type: 'string' },
+        selector: { type: 'string' },
+        double: { type: 'boolean' },
+        button: { type: 'string', enum: ['left', 'right', 'middle'] },
+      },
       required: ['tab'],
     },
   },
@@ -130,6 +136,76 @@ const TOOLS = [
     },
   },
   {
+    name: 'hover',
+    description: 'Move the mouse over an element (menus, tooltips). Real mouse on Chrome and Edge; simulated events on Firefox (CSS :hover does not apply there).',
+    inputSchema: {
+      type: 'object',
+      properties: { tab: TAB, ref: { type: 'string' }, selector: { type: 'string' } },
+      required: ['tab'],
+    },
+  },
+  {
+    name: 'drag',
+    description: 'Drag one element onto another (HTML5 drag and drop or mouse-based sortable lists).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        from_ref: { type: 'string' },
+        from_selector: { type: 'string' },
+        to_ref: { type: 'string' },
+        to_selector: { type: 'string' },
+      },
+      required: ['tab'],
+    },
+  },
+  {
+    name: 'mouse',
+    description: 'Mouse action at viewport coordinates in CSS pixels: click (default), move, down, up or wheel. For canvases, maps and sliders where there is no element to target.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        op: { type: 'string', enum: ['click', 'move', 'down', 'up', 'wheel'] },
+        x: { type: 'number' },
+        y: { type: 'number' },
+        button: { type: 'string', enum: ['left', 'right', 'middle'] },
+        double: { type: 'boolean' },
+        delta_x: { type: 'number', description: 'wheel: horizontal scroll in pixels.' },
+        delta_y: { type: 'number', description: 'wheel: vertical scroll in pixels.' },
+      },
+      required: ['tab', 'x', 'y'],
+    },
+  },
+  {
+    name: 'upload',
+    description: 'Put local files into a file input. Target the <input type=file> or the button that opens the file chooser. files are absolute paths on this computer.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        ref: { type: 'string' },
+        selector: { type: 'string' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of the files to upload.' },
+      },
+      required: ['tab', 'files'],
+    },
+  },
+  {
+    name: 'dialog',
+    description: "Set how the page's next alert/confirm/prompt is answered, before the action that opens it. Without this, alerts are accepted and confirm/prompt are dismissed, and the action's result reports each dialog. keep applies the answer to every dialog on this page.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        action: { type: 'string', enum: ['accept', 'dismiss'] },
+        text: { type: 'string', description: 'prompt: the text to answer with.' },
+        keep: { type: 'boolean' },
+      },
+      required: ['tab', 'action'],
+    },
+  },
+  {
     name: 'handoff',
     description:
       'Ask the user to do something only a person can do in a tab (log in, 2FA, passkey, captcha, payment or delete ' +
@@ -168,6 +244,43 @@ function tabInfo(browser, r) {
     (r.container ? `\ncontainer: ${r.container}` : '') +
     (r.reopened ? '\nnote: the containers add-on reopened this site in its assigned container; this is the new tab, use this handle' : '') +
     (r.timedOut ? '\nnote: the page was still loading when the wait ended' : '');
+}
+
+function fmtDialogs(list, hint) {
+  if (!Array.isArray(list) || !list.length) return '';
+  const lines = list.map((d) => `\ndialog: ${d.kind} ${JSON.stringify(d.message)} -> ${d.answer}${d.text != null ? ' with ' + JSON.stringify(d.text) : ''}`);
+  const dismissed = list.some((d) => d.answer === 'dismissed');
+  return lines.join('') + (hint && dismissed ? '\nnote: to accept it instead, call dialog with action accept, then repeat the action' : '');
+}
+
+const MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+  pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv', json: 'application/json', html: 'text/html', xml: 'application/xml',
+  zip: 'application/zip', mp4: 'video/mp4', mp3: 'audio/mpeg', doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
+const UPLOAD_LIMIT = 50 * 1024 * 1024;
+
+// Checks the files exist. Chrome and Edge read them from disk themselves; Firefox gets their contents.
+async function uploadFiles(list, browser) {
+  list = (Array.isArray(list) ? list : [list]).filter((f) => f != null && String(f).trim());
+  if (!list.length) throw new Error('files is required: absolute paths of the files to upload');
+  const st = await relayCall('status', {}, 10000);
+  const b = st.browsers.find((x) => x.id === browser) || st.browsers.find((x) => x.kind === browser);
+  const firefox = (b ? b.kind : browser) === 'firefox';
+  let total = 0;
+  return list.map((f) => {
+    const p = path.resolve(String(f).trim());
+    let s;
+    try { s = fs.statSync(p); } catch { throw new Error('file not found: ' + p); }
+    if (!s.isFile()) throw new Error('not a file: ' + p);
+    total += s.size;
+    if (firefox && total > UPLOAD_LIMIT) throw new Error('Firefox uploads are limited to 50 MB in total');
+    const o = { path: p, name: path.basename(p), size: s.size, type: MIME[path.extname(p).slice(1).toLowerCase()] || '', mtime: Math.round(s.mtimeMs) };
+    if (firefox) o.data = fs.readFileSync(p).toString('base64');
+    return o;
+  });
 }
 
 async function relayCall(method, params, timeoutMs) {
@@ -227,6 +340,8 @@ async function runTool(name, a) {
     throw new Error('tab is required');
   }
 
+  if (name === 'upload') args.files = await uploadFiles(a.files, browser);
+
   const wait = name === 'handoff'
     ? Math.min(Math.max((Number(a.timeout_s) || 300) * 1000, 10000), 600000)
     : Math.min(Math.max(Number(a.timeout_ms || a.time_ms) || 30000, 1000), 120000);
@@ -255,7 +370,12 @@ async function runTool(name, a) {
     case 'click':
     case 'type':
     case 'press_key':
-      return text(r.done + (r.navigated ? `\nurl now: ${r.url}` : ''));
+    case 'hover':
+    case 'drag':
+    case 'mouse':
+    case 'upload':
+    case 'dialog':
+      return text(r.done + (r.note ? `\nnote: ${r.note}` : '') + fmtDialogs(r.dialogs, name !== 'dialog') + (r.navigated ? `\nurl now: ${r.url}` : ''));
     case 'evaluate': {
       const v = String(r.value);
       return text(v.length > 20000 ? v.slice(0, 20000) + '\n… cut off at 20000 characters' : v);

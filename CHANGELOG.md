@@ -5,6 +5,39 @@ the version in `package.json` is also the extension version.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-21
+
+Phase 1 of the all-in-one roadmap: real input, uploads and dialogs.
+
+- **Real input on Chrome and Edge.** `click`, `type` and `press_key` now go through the browser's debugger API, so
+  pages see trusted events (`isTrusted`), the same as a person's mouse and keyboard. The debugger attaches only for
+  the action and detaches after 8 s idle; meanwhile the browser shows "browzat started debugging this browser".
+  Focus emulation keeps it working in background tabs. Simulated input is still used on Firefox (no debugger API for
+  extensions), for elements inside iframes, when the element is covered by something else (the result says by what),
+  and when another debugger (DevTools) is attached to the tab.
+- New tools:
+  - `hover`: real mouse move on Chrome and Edge, simulated events on Firefox.
+  - `drag`: HTML5 drag and drop (the drag is intercepted and replayed onto the target, then always finished or
+    cancelled) and mouse-based dragging.
+  - `mouse`: click, move, down, up or wheel at viewport coordinates, with left/right/middle button and double click.
+  - `upload`: put local files into a file input, or into the file chooser a button opens (Chrome and Edge read the
+    files from disk; Firefox receives them, up to 50 MB in total).
+  - `dialog`: set the answer for the next alert/confirm/prompt (accept or dismiss, prompt text, or keep for every
+    dialog on the page).
+- **Dialogs never block an agent tab:** before each action alert/confirm/prompt are answered automatically (alert OK,
+  confirm and prompt Cancel unless `dialog` says otherwise), and the action's result lists each dialog.
+- `click` takes `button` (left, right, middle).
+- Chrome and Edge extensions ask for the `debugger` permission.
+- Tests: 12 new end-to-end checks (real input, typing, upload, missing file, dialogs, hover, drag, mouse); all pass on
+  real Chrome, Edge and Firefox profiles.
+- **Linux verified** on an Ubuntu 24.04 server: `install.sh`, Chrome for Testing 159 and Firefox 160 under Xvfb, and
+  two Chromium profiles at once all pass the full suite.
+- `install.sh` works without npm: it fetches `ws` from the registry at the pinned version and verifies its sha512.
+- Fixed: a drag whose start the browser reported late (seen on a fresh, slower browser) was left unfinished, and the
+  tab then ignored clicks. browzat now waits up to a second for the drag to start and always cancels a late one.
+- `test/launch-chromium.js` takes `CHROME_EXTRA_ARGS` (for `--no-sandbox` on Ubuntu 23.10+ test builds); the
+  coordinate check allows ±1 px for Firefox's whole-pixel rounding; the End-key check waits for smooth scrolling.
+
 ## [0.3.0] - 2026-11-20
 
 - New tool **`handoff`**: the agent asks the user to do something only a person can do (login, 2FA, passkey,
@@ -35,6 +68,7 @@ First published version.
 - Windows installer (`install.ps1`) and Linux installer (`install.sh`, not yet tested on Linux).
 - End-to-end tests on real and throwaway profiles.
 
-[Unreleased]: https://github.com/AnistoMejin/browzat/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/AnistoMejin/browzat/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/AnistoMejin/browzat/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AnistoMejin/browzat/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AnistoMejin/browzat/releases/tag/v0.2.0

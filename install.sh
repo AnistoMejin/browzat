@@ -27,7 +27,8 @@ fail() { echo "[browser-mcp] ERROR: $*" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || fail "Node.js 20 or newer is required (https://nodejs.org). Install it and run this again."
 MAJOR=$(node -p "process.versions.node.split('.')[0]")
 [ "$MAJOR" -ge 20 ] || fail "Node.js 20 or newer is required; found $(node --version)."
-command -v npm >/dev/null 2>&1 || fail "npm is required (it comes with Node.js)."
+HAVE_NPM=1
+command -v npm >/dev/null 2>&1 || HAVE_NPM=0
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$DIR"
@@ -47,7 +48,33 @@ else
 fi
 
 cd "$DIR"
-npm install --omit=dev --no-audit --no-fund || fail "npm install failed."
+if [ "$HAVE_NPM" -eq 1 ]; then
+  npm install --omit=dev --no-audit --no-fund || fail "npm install failed."
+else
+  # Some Node packages (Ubuntu's apt nodejs, for example) come without npm. The only dependency is ws, which has no
+  # dependencies of its own: fetch the exact version pinned in package-lock.json and check its sha512 integrity.
+  say "npm not found; fetching the ws package from the npm registry instead"
+  node -e '
+    const fs = require("fs"), crypto = require("crypto"), { execFileSync } = require("child_process");
+    const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+    const ws = lock.packages && lock.packages["node_modules/ws"];
+    if (!ws || !ws.resolved || !ws.integrity) { console.error("ws is not pinned in package-lock.json"); process.exit(1); }
+    (async () => {
+      const r = await fetch(ws.resolved);
+      if (!r.ok) throw new Error("download failed: HTTP " + r.status);
+      const buf = Buffer.from(await r.arrayBuffer());
+      const [algo, want] = ws.integrity.split("-");
+      const got = crypto.createHash(algo).update(buf).digest("base64");
+      if (got !== want) throw new Error("integrity check failed for " + ws.resolved);
+      fs.rmSync("node_modules/ws", { recursive: true, force: true });
+      fs.mkdirSync("node_modules/ws", { recursive: true });
+      fs.writeFileSync("node_modules/.ws.tgz", buf);
+      execFileSync("tar", ["-xzf", "node_modules/.ws.tgz", "-C", "node_modules/ws", "--strip-components=1"]);
+      fs.rmSync("node_modules/.ws.tgz");
+      console.log("[browser-mcp] ws " + ws.version + " installed (integrity verified)");
+    })().catch((e) => { console.error(String(e.message || e)); process.exit(1); });
+  ' || fail "could not fetch the ws package; install npm (for example: sudo apt install npm) and run this again."
+fi
 node extension/build.js || fail "building the extension failed."
 
 if [ "$CLAUDE" -eq 1 ]; then

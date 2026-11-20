@@ -297,21 +297,42 @@ function frameOfRef(ref) {
 }
 
 // Runs a page action, then reports whether the tab moved to another URL.
+const PAGE_GONE = /navigated|Frame with ID|frame was removed|message port closed|context invalidated|No tab with id|Inspected target navigated|Cannot find context/i;
+
 async function act(p, action) {
   const id = need(p);
   const before = await api.tabs.get(id);
-  let done;
-  try {
-    const res = await run(id, bmcpAct, [Object.assign({}, p, { action })], { frameId: frameOfRef(p.ref) });
-    done = unwrap(res[0]);
-  } catch (e) {
-    // A click that starts a navigation can tear the page down before the answer comes back.
-    if (!/navigated|Frame with ID|frame was removed|message port closed|context invalidated/i.test(String(e.message))) throw e;
-    done = action + ' sent (the page navigated)';
+  try { await runDialogs(id, { op: 'install' }); } catch (e) {}
+  let done = null;
+  let note = '';
+  // Real input through the debugger on Chrome and Edge, for elements in the top frame.
+  if (HAS_CDP && !p.simulated && frameOfRef(p.ref) === 0) {
+    try {
+      const r = await realAct(id, p, action);
+      if (r && r.done) done = r.done;
+      else if (r && r.fallback) note = 'simulated input was used because ' + r.fallback;
+    } catch (e) {
+      const m = String((e && e.message) || e);
+      if (PAGE_GONE.test(m)) done = action + ' sent (the page navigated)';
+      else if (/debugger|Cannot attach|Cannot access|another debugger/i.test(m)) note = 'simulated input was used: real input is unavailable here (' + m + ')';
+      else throw e;
+    }
+  }
+  if (done == null) {
+    try {
+      const res = await run(id, bmcpAct, [Object.assign({}, p, { action })], { frameId: frameOfRef(p.ref) });
+      done = unwrap(res[0]);
+    } catch (e) {
+      // A click that starts a navigation can tear the page down before the answer comes back.
+      if (!PAGE_GONE.test(String(e.message))) throw e;
+      done = action + ' sent (the page navigated)';
+    }
   }
   await sleep(350);
   const after = await waitForLoad(id, clamp(p.timeout_ms || 10000, 500, 60000), false);
-  return { done, url: after.tab.url, title: after.tab.title, navigated: after.tab.url !== before.url };
+  let dialogs = [];
+  try { dialogs = await runDialogs(id, { op: 'take' }); } catch (e) {}
+  return { done, note, dialogs, url: after.tab.url, title: after.tab.title, navigated: after.tab.url !== before.url };
 }
 
 async function toDataUrl(blob) {
@@ -333,6 +354,183 @@ async function downscale(dataUrl, maxW) {
   } catch (e) {
     return { dataUrl };
   }
+}
+
+// ---- real input on Chrome and Edge, through the debugger ----
+// Attached only while needed: each command restarts an idle timer, and the debugger detaches when it runs out, so
+// the browser's "started debugging this browser" bar is shown only while the agent acts. Firefox has no debugger API
+// for extensions and keeps the simulated input of page.js.
+
+const HAS_CDP = !IS_FIREFOX && !!api.debugger;
+const CDP_IDLE_MS = 8000;
+const cdpTabs = new Map(); // tabId -> { timer }
+const cdpWaiters = new Set();
+
+async function cdpAttach(tabId) {
+  let s = cdpTabs.get(tabId);
+  if (!s) {
+    await api.debugger.attach({ tabId }, '1.3');
+    s = {};
+    cdpTabs.set(tabId, s);
+    // Agent tabs usually sit in the background, where Chrome ignores mouse presses and some keys. Focus emulation
+    // makes the page behave as if it had focus, without bringing it to the front.
+    try { await api.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true }); } catch (e) {}
+  }
+  clearTimeout(s.timer);
+  s.timer = setTimeout(() => cdpDetach(tabId), CDP_IDLE_MS);
+}
+
+async function cdpDetach(tabId) {
+  const s = cdpTabs.get(tabId);
+  if (!s) return;
+  cdpTabs.delete(tabId);
+  clearTimeout(s.timer);
+  try { await api.debugger.detach({ tabId }); } catch (e) {}
+}
+
+async function cdp(tabId, method, params) {
+  await cdpAttach(tabId);
+  return api.debugger.sendCommand({ tabId }, method, params || {});
+}
+
+function cdpEvent(tabId, method, ms) {
+  return new Promise((resolve) => {
+    const w = { tabId, method, resolve };
+    cdpWaiters.add(w);
+    setTimeout(() => { if (cdpWaiters.delete(w)) resolve(null); }, ms);
+  });
+}
+
+if (HAS_CDP) {
+  api.debugger.onDetach.addListener((src) => {
+    const s = cdpTabs.get(src.tabId);
+    if (s) { clearTimeout(s.timer); cdpTabs.delete(src.tabId); }
+  });
+  api.debugger.onEvent.addListener((src, method, params) => {
+    for (const w of cdpWaiters) {
+      if (w.tabId === src.tabId && w.method === method) { cdpWaiters.delete(w); w.resolve(params || {}); }
+    }
+  });
+}
+
+const MOD = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
+const KEYS = {
+  Enter: [13, '\r'], Tab: [9], Escape: [27], Backspace: [8], Delete: [46], Insert: [45],
+  ArrowUp: [38], ArrowDown: [40], ArrowLeft: [37], ArrowRight: [39], Home: [36], End: [35], PageUp: [33], PageDown: [34],
+  Control: [17, null, 'ControlLeft'], Shift: [16, null, 'ShiftLeft'], Alt: [18, null, 'AltLeft'], Meta: [91, null, 'MetaLeft'],
+  ' ': [32, ' ', 'Space'],
+};
+for (let i = 1; i <= 12; i++) KEYS['F' + i] = [111 + i];
+const PUNCT = {
+  '-': [189, 'Minus'], '=': [187, 'Equal'], ',': [188, 'Comma'], '.': [190, 'Period'], '/': [191, 'Slash'], ';': [186, 'Semicolon'],
+  "'": [222, 'Quote'], '[': [219, 'BracketLeft'], ']': [221, 'BracketRight'], '\\': [220, 'Backslash'], '`': [192, 'Backquote'],
+};
+const KEY_ALIAS = { esc: 'Escape', space: ' ', return: 'Enter', del: 'Delete', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', ctrl: 'Control', control: 'Control', shift: 'Shift', alt: 'Alt', meta: 'Meta', cmd: 'Meta', win: 'Meta', pgup: 'PageUp', pgdn: 'PageDown' };
+const EDIT_COMMANDS = { a: 'selectAll', c: 'copy', x: 'cut', v: 'paste', z: 'undo', y: 'redo' };
+
+function keyInfo(name) {
+  const n = KEY_ALIAS[name.toLowerCase()] || name;
+  if (KEYS[n]) return { key: n, code: KEYS[n][2] || n, kc: KEYS[n][0], text: KEYS[n][1] || undefined };
+  if (n.length === 1) {
+    if (/[a-z]/i.test(n)) return { key: n, code: 'Key' + n.toUpperCase(), kc: n.toUpperCase().charCodeAt(0), text: n };
+    if (/\d/.test(n)) return { key: n, code: 'Digit' + n, kc: n.charCodeAt(0), text: n };
+    if (PUNCT[n]) return { key: n, code: PUNCT[n][1], kc: PUNCT[n][0], text: n };
+    return { key: n, code: '', kc: 0, text: n };
+  }
+  const k = Object.keys(KEYS).find((x) => x.toLowerCase() === n.toLowerCase());
+  if (k) return keyInfo(k);
+  throw new Error('unknown key ' + JSON.stringify(name));
+}
+
+async function cdpKeys(tabId, combo) {
+  const raw = String(combo || '');
+  const parts = raw.split('+').map((s) => s.trim()).filter(Boolean);
+  if (raw.endsWith('+') && raw.length > 1) parts.push('+');
+  const main = parts.pop();
+  if (!main) throw new Error('key is required');
+  const mods = parts.map((m) => keyInfo(m));
+  let bits = 0;
+  for (const m of mods) {
+    if (MOD[m.key] == null) throw new Error(m.key + ' is not a modifier (use Control, Shift, Alt or Meta)');
+    bits |= MOD[m.key];
+    await cdp(tabId, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', modifiers: bits, key: m.key, code: m.code, windowsVirtualKeyCode: m.kc, nativeVirtualKeyCode: m.kc });
+  }
+  const k = keyInfo(main);
+  const shortcut = (bits & (MOD.Alt | MOD.Control | MOD.Meta)) !== 0;
+  let text = shortcut ? undefined : k.text;
+  if (text && (bits & MOD.Shift) && /^[a-z]$/.test(text)) text = text.toUpperCase();
+  const ev = { modifiers: bits, key: text && text.length === 1 && text !== '\r' ? text : k.key, code: k.code, windowsVirtualKeyCode: k.kc, nativeVirtualKeyCode: k.kc };
+  const cmd = shortcut && (bits & (MOD.Control | MOD.Meta)) ? EDIT_COMMANDS[k.key.toLowerCase()] : null;
+  await cdp(tabId, 'Input.dispatchKeyEvent', Object.assign({ type: text ? 'keyDown' : 'rawKeyDown', text, unmodifiedText: text }, ev, cmd ? { commands: [cmd] } : {}));
+  await cdp(tabId, 'Input.dispatchKeyEvent', Object.assign({ type: 'keyUp' }, ev));
+  for (const m of mods.reverse()) {
+    bits &= ~MOD[m.key];
+    await cdp(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: bits, key: m.key, code: m.code, windowsVirtualKeyCode: m.kc, nativeVirtualKeyCode: m.kc });
+  }
+}
+
+const BUTTONS = { left: 1, right: 2, middle: 4 };
+const mouseHeld = new Map(); // tabId -> button name while a mouse button is held down
+
+async function cdpMouse(tabId, op, x, y, o) {
+  o = o || {};
+  const button = o.button || 'left';
+  const held = mouseHeld.get(tabId);
+  const send = (type, extra) => cdp(tabId, 'Input.dispatchMouseEvent', Object.assign({ type, x, y }, extra));
+  if (op === 'move') return send('mouseMoved', { button: held || 'none', buttons: held ? BUTTONS[held] : 0 });
+  if (op === 'wheel') return send('mouseWheel', { deltaX: Number(o.delta_x) || 0, deltaY: Number(o.delta_y) || 0 });
+  if (op === 'down') {
+    mouseHeld.set(tabId, button);
+    return send('mousePressed', { button, buttons: BUTTONS[button], clickCount: 1 });
+  }
+  if (op === 'up') {
+    mouseHeld.delete(tabId);
+    return send('mouseReleased', { button, buttons: 0, clickCount: 1 });
+  }
+  // click
+  await send('mouseMoved', { button: 'none' });
+  const n = o.double ? 2 : 1;
+  for (let c = 1; c <= n; c++) {
+    await send('mousePressed', { button, buttons: BUTTONS[button], clickCount: c });
+    await send('mouseReleased', { button, buttons: 0, clickCount: c });
+  }
+}
+
+async function locate(tabId, a) {
+  return unwrap((await run(tabId, bmcpLocate, [a], { frameId: 0 }))[0]);
+}
+
+// Dialog guard: injected before agent actions; answers alert/confirm/prompt and records them.
+function runDialogs(tabId, o) {
+  return run(tabId, bmcpDialogs, [o], IS_FIREFOX ? { frameId: 0 } : { frameId: 0, world: 'MAIN' }).then((r) => unwrap(r[0]));
+}
+
+// Real input for click / type / key. Returns null to let the caller fall back to simulated input.
+async function realAct(tabId, p, action) {
+  if (action === 'click') {
+    const loc = await locate(tabId, { ref: p.ref, selector: p.selector });
+    if (loc.disabled) throw new Error('the element is disabled');
+    if (!loc.visible || !loc.reachable) return { fallback: loc.visible ? 'it is covered by ' + loc.cover : 'it has no visible area on screen' };
+    await cdpMouse(tabId, 'click', loc.x, loc.y, { double: !!p.double, button: p.button });
+    return { done: (p.double ? 'double-clicked ' : p.button === 'right' ? 'right-clicked ' : 'clicked ') + loc.desc };
+  }
+  if (action === 'type') {
+    const prepare = p.clear === false ? 'focus-end' : 'focus-select';
+    const loc = await locate(tabId, { ref: p.ref, selector: p.selector, focused: !p.ref && !p.selector, prepare });
+    if (!loc.textField) return { fallback: '' }; // selects, checkboxes and non-fields keep the simulated path and its messages
+    const text = String(p.text == null ? '' : p.text);
+    if (text) await cdp(tabId, 'Input.insertText', { text });
+    else if (p.clear !== false) await cdpKeys(tabId, 'Delete');
+    if (p.submit) await cdpKeys(tabId, 'Enter');
+    return { done: 'typed into ' + loc.desc + (p.submit ? ' and pressed Enter' : '') };
+  }
+  if (action === 'key') {
+    let desc = 'the focused element';
+    if (p.ref || p.selector) desc = (await locate(tabId, { ref: p.ref, selector: p.selector, focus: true })).desc;
+    await cdpKeys(tabId, p.key);
+    return { done: 'pressed ' + p.key + ' on ' + desc };
+  }
+  return null;
 }
 
 // ---- tools ----
@@ -560,6 +758,151 @@ const handlers = {
     }
     return Object.assign(await downscale(dataUrl, clamp(p.max_width || 1280, 320, 2560)), { raised });
   },
+};
+
+handlers.hover = async (p) => {
+  const id = need(p);
+  if (HAS_CDP && !p.simulated && frameOfRef(p.ref) === 0) {
+    try {
+      const loc = await locate(id, { ref: p.ref, selector: p.selector });
+      if (loc.visible) {
+        await cdpMouse(id, 'move', loc.x, loc.y);
+        return { done: 'hovered over ' + loc.desc };
+      }
+    } catch (e) {
+      if (/ref |selector /.test(String(e.message))) throw e;
+    }
+  }
+  return { done: unwrap((await run(id, bmcpPointer, [{ action: 'hover', ref: p.ref, selector: p.selector }], { frameId: frameOfRef(p.ref) }))[0]) };
+};
+
+handlers.drag = async (p) => {
+  const id = need(p);
+  try { await runDialogs(id, { op: 'install' }); } catch (e) {}
+  if (HAS_CDP && !p.simulated && frameOfRef(p.from_ref) === 0 && frameOfRef(p.to_ref) === 0) {
+    let a = await locate(id, { ref: p.from_ref, selector: p.from_selector });
+    let b = await locate(id, { ref: p.to_ref, selector: p.to_selector, noscroll: true });
+    if (!b.visible) {
+      b = await locate(id, { ref: p.to_ref, selector: p.to_selector });
+      a = await locate(id, { ref: p.from_ref, selector: p.from_selector, noscroll: true });
+    }
+    if (a.visible && b.visible) {
+      // HTML5 drag and drop: let the debugger intercept the drag so it can be replayed onto the target.
+      await cdp(id, 'Input.setInterceptDrags', { enabled: true });
+      let drag = null;
+      let dropped = false;
+      try {
+        const intercepted = cdpEvent(id, 'Input.dragIntercepted', 2000);
+        intercepted.then((d) => { drag = d; });
+        await cdpMouse(id, 'move', a.x, a.y);
+        await cdpMouse(id, 'down', a.x, a.y);
+        const steps = 6;
+        for (let i = 1; i <= steps && !drag; i++) {
+          await cdpMouse(id, 'move', a.x + ((b.x - a.x) * i) / steps, a.y + ((b.y - a.y) * i) / steps);
+          await sleep(30);
+        }
+        // A fresh or busy browser can report the drag start late: give it up to a second.
+        if (!drag) await Promise.race([intercepted, sleep(1000)]);
+        if (drag && drag.data) {
+          // An HTML5 drag started: the browser handed it to us; replay it over the target and drop it there.
+          await cdp(id, 'Input.dispatchDragEvent', { type: 'dragEnter', x: b.x, y: b.y, data: drag.data });
+          await cdp(id, 'Input.dispatchDragEvent', { type: 'dragOver', x: b.x, y: b.y, data: drag.data });
+          await cdp(id, 'Input.dispatchDragEvent', { type: 'drop', x: b.x, y: b.y, data: drag.data });
+          dropped = true;
+        } else {
+          await cdpMouse(id, 'move', b.x, b.y);
+        }
+        await cdpMouse(id, 'up', b.x, b.y);
+        return { done: 'dragged ' + a.desc + ' onto ' + b.desc + (drag ? ' (HTML5 drag and drop)' : ' (mouse drag)') };
+      } finally {
+        mouseHeld.delete(id);
+        // Never leave a drag half-finished: the tab would ignore mouse presses afterwards. A drag start that arrives
+        // even later than the wait above is cancelled too.
+        if (!dropped) {
+          const late = drag || (await Promise.race([intercepted, sleep(300)]));
+          if (late && late.data) { try { await cdp(id, 'Input.dispatchDragEvent', { type: 'dragCancel', x: b.x, y: b.y, data: late.data }); } catch (e) {} }
+        }
+        try { await cdp(id, 'Input.setInterceptDrags', { enabled: false }); } catch (e) {}
+      }
+    }
+  }
+  return { done: unwrap((await run(id, bmcpPointer, [Object.assign({ action: 'drag' }, p)], { frameId: 0 }))[0]) };
+};
+
+handlers.mouse = async (p) => {
+  const id = need(p);
+  const op = p.op || 'click';
+  if (!['click', 'move', 'down', 'up', 'wheel'].includes(op)) throw new Error('op must be click, move, down, up or wheel');
+  try { await runDialogs(id, { op: 'install' }); } catch (e) {}
+  const before = await api.tabs.get(id);
+  let done;
+  if (HAS_CDP && !p.simulated) {
+    await cdpMouse(id, op, Number(p.x) || 0, Number(p.y) || 0, p);
+    done = (op === 'click' ? (p.double ? 'double-click' : p.button === 'right' ? 'right-click' : 'click') : op) + ' at ' + Math.round(p.x) + ',' + Math.round(p.y);
+  } else {
+    done = unwrap((await run(id, bmcpPointer, [Object.assign({ action: 'mouse', op }, p)], { frameId: 0 }))[0]);
+  }
+  await sleep(250);
+  const after = await waitForLoad(id, 10000, false);
+  let dialogs = [];
+  try { dialogs = await runDialogs(id, { op: 'take' }); } catch (e) {}
+  return { done, dialogs, url: after.tab.url, navigated: after.tab.url !== before.url };
+};
+
+handlers.upload = async (p) => {
+  const id = need(p);
+  const files = Array.isArray(p.files) ? p.files : [];
+  if (!files.length) throw new Error('files is required');
+  const names = files.map((f) => f.name).join(', ');
+  if (HAS_CDP) {
+    const mark = randHex(8);
+    const found = unwrap((await run(id, bmcpFiles, [{ op: 'find', ref: p.ref, selector: p.selector, mark }], { frameId: 0 }))[0]);
+    if (found.input) {
+      if (files.length > 1 && !found.multiple) throw new Error('this file input takes one file only');
+      try {
+        const doc = await cdp(id, 'DOM.getDocument', { depth: 0 });
+        const q = await cdp(id, 'DOM.querySelector', { nodeId: doc.root.nodeId, selector: '[data-bmcp-upload="' + mark + '"]' });
+        if (!q || !q.nodeId) throw new Error('could not find the file input through the debugger');
+        await cdp(id, 'DOM.setFileInputFiles', { files: files.map((f) => f.path), nodeId: q.nodeId });
+      } finally {
+        run(id, bmcpFiles, [{ op: 'unmark' }], { frameId: 0 }).catch(() => {});
+      }
+      return { done: 'attached ' + files.length + ' file(s) to the file input: ' + names };
+    }
+    // No file input to target directly: click the element and catch the file chooser it opens.
+    const loc = await locate(id, { ref: p.ref, selector: p.selector });
+    if (!loc.visible) throw new Error('found no file input, and the element is not visible to click');
+    await cdp(id, 'Page.enable');
+    await cdp(id, 'Page.setInterceptFileChooserDialog', { enabled: true });
+    try {
+      const opened = cdpEvent(id, 'Page.fileChooserOpened', 5000);
+      await cdpMouse(id, 'click', loc.x, loc.y);
+      const ev = await opened;
+      if (!ev) throw new Error('clicking ' + loc.desc + ' did not open a file chooser; target the <input type=file> itself (snapshot with selector "input[type=file]")');
+      if (files.length > 1 && ev.mode === 'selectSingle') throw new Error('this file chooser takes one file only');
+      await cdp(id, 'DOM.setFileInputFiles', { files: files.map((f) => f.path), backendNodeId: ev.backendNodeId });
+    } finally {
+      try { await cdp(id, 'Page.setInterceptFileChooserDialog', { enabled: false }); } catch (e) {}
+    }
+    return { done: 'chose ' + files.length + ' file(s) in the file chooser of ' + loc.desc + ': ' + names };
+  }
+  // Firefox: the files travel as base64 and are put on the input in the page.
+  if (files.some((f) => typeof f.data !== 'string')) throw new Error('file contents are missing');
+  const r = unwrap((await run(id, bmcpFiles, [{ op: 'set', ref: p.ref, selector: p.selector, files }], { frameId: 0 }))[0]);
+  if (r.input === false) throw new Error('found no file input for this element; target the <input type=file> itself (snapshot with selector "input[type=file]")');
+  return { done: 'attached ' + r.count + ' file(s) to the file input: ' + names };
+};
+
+handlers.dialog = async (p) => {
+  const id = need(p);
+  const action = p.action === 'accept' ? 'accept' : 'dismiss';
+  await runDialogs(id, { op: 'arm', action, text: p.text, keep: !!p.keep });
+  const seen = await runDialogs(id, { op: 'take' });
+  return {
+    done: (p.keep ? 'from now on every dialog in this page will be ' : 'the next dialog will be ') +
+      (action === 'accept' ? 'accepted' : 'dismissed') + (action === 'accept' && p.text != null ? ' with the text ' + JSON.stringify(String(p.text)) : ''),
+    dialogs: seen,
+  };
 };
 
 handlers.handoff = async (p) => {

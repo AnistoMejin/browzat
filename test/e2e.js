@@ -25,7 +25,24 @@ const FORM = `<!doctype html><html><head><meta charset="utf-8"><title>BMCP test<
 <button id="late">Load late</button>
 <table><tr><th>Host</th><th>Role</th></tr><tr><td>alpha</td><td>primary</td></tr></table>
 <div style="display:none">hidden text must not show</div>
+<button id="real">Real click test</button> <span id="realOut">none</span>
+<input type="file" id="file" multiple aria-label="Attach files"> <span id="fileOut">no files</span>
+<button id="ask">Ask confirm</button> <button id="pr">Ask prompt</button> <span id="dlgOut">no dialog</span>
+<div id="hov" style="display:inline-block;padding:8px;border:1px solid #888">Hover me</div> <span id="hovOut">not hovered</span>
+<div id="src" draggable="true" style="display:inline-block;padding:8px;background:#ddd">Drag me</div>
+<div id="dst" style="display:inline-block;padding:20px;border:2px dashed #888">Drop here</div> <span id="dropOut">not dropped</span>
+<div id="pad" style="width:120px;height:60px;background:#cde">Mouse pad</div> <span id="padOut">no mouse</span>
 <script>
+const $ = (id) => document.getElementById(id);
+$('real').addEventListener('click', (e) => { $('realOut').textContent = 'click trusted=' + e.isTrusted; });
+$('file').addEventListener('change', () => { $('fileOut').textContent = 'files: ' + [...$('file').files].map((f) => f.name + ':' + f.size).join(','); });
+$('ask').addEventListener('click', () => { $('dlgOut').textContent = 'confirm=' + confirm('Delete it?'); });
+$('pr').addEventListener('click', () => { $('dlgOut').textContent = 'prompt=' + prompt('Your name?', 'nobody'); });
+$('hov').addEventListener('mouseenter', () => { $('hovOut').textContent = 'hovered'; });
+$('src').addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', 'payload-42'); });
+$('dst').addEventListener('dragover', (e) => e.preventDefault());
+$('dst').addEventListener('drop', (e) => { e.preventDefault(); $('dropOut').textContent = 'dropped ' + e.dataTransfer.getData('text/plain'); });
+$('pad').addEventListener('click', (e) => { $('padOut').textContent = 'pad click at ' + Math.round(e.offsetX) + ',' + Math.round(e.offsetY); });
 document.getElementById('f').addEventListener('submit', (e) => {
   e.preventDefault();
   document.getElementById('out').textContent = 'submitted:' + document.getElementById('name').value + ':' +
@@ -92,7 +109,7 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
     const init = await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
     mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
     const tools = await request('tools/list', {});
-    check('MCP handshake and tool list', init.result.serverInfo.name === 'browser-mcp' && tools.result.tools.length === 11, JSON.stringify(init.result));
+    check('MCP handshake and tool list', init.result.serverInfo.name === 'browser-mcp' && tools.result.tools.length === 16, JSON.stringify(init.result));
 
     let r = await call('status', {});
     check(`status lists ${browser}`, new RegExp('^' + browser + '\\b', 'm').test(r.text), r.text);
@@ -153,7 +170,12 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
     r = await call('snapshot', { tab });
     check('read the second page', /heading "Second page content"/.test(r.text), r.text);
     r = await call('press_key', { tab, key: 'End' });
-    const y = await call('evaluate', { tab, code: 'Math.round(window.scrollY)' });
+    // A real End key scrolls smoothly on Chrome and Edge, as it does for a person: give the animation time.
+    let y = { text: '0' };
+    for (let i = 0; i < 10 && Number(y.text) <= 500; i++) {
+      await new Promise((res) => setTimeout(res, 200));
+      y = await call('evaluate', { tab, code: 'Math.round(window.scrollY)' });
+    }
     check('press_key End scrolls the page', /^pressed End/.test(r.text) && Number(y.text) > 500, r.text + ' scrollY=' + y.text);
     r = await call('navigate', { tab, action: 'back' });
     check('navigate back', /url: .*\/form/.test(r.text), r.text);
@@ -200,6 +222,59 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
         check('follows a navigation that the containers add-on moves to a container', !!ntab && ntab !== tab && /container: Work/.test(r.text) && /reopened/.test(r.text), r.text);
         if (ntab && ntab !== tab) await call('tabs', { action: 'close', tab: ntab });
       }
+    }
+
+    // Phase 1: real input, upload, dialogs, hover, drag, mouse.
+    {
+      const real = browser !== 'firefox' && !/^firefox/.test(browser);
+      r = await call('tabs', { action: 'new', browser, url: base + '/form' });
+      const ptab = (/^tab: (\S+)/m.exec(r.text) || [])[1];
+      const read = async (id) => (await call('evaluate', { tab: ptab, code: `document.getElementById('${id}').textContent` })).text.trim();
+
+      r = await call('click', { tab: ptab, selector: '#real' });
+      const rc = await read('realOut');
+      check(real ? 'click is real input (isTrusted) on Chrome/Edge' : 'click is simulated on Firefox', rc === 'click trusted=' + real, rc + ' | ' + r.text);
+
+      r = await call('type', { tab: ptab, selector: '#name', text: 'Real typing' });
+      const typed = (await call('evaluate', { tab: ptab, code: "document.getElementById('name').value" })).text.trim();
+      check('type replaces the field value', typed === 'Real typing', typed + ' | ' + r.text);
+      r = await call('type', { tab: ptab, selector: '#name', text: ' more', clear: false });
+      const typed2 = (await call('evaluate', { tab: ptab, code: "document.getElementById('name').value" })).text.trim();
+      check('type with clear:false appends', typed2 === 'Real typing more', typed2);
+
+      const tmp = path.join(require('os').tmpdir(), 'browzat-e2e-upload.txt');
+      fs.writeFileSync(tmp, 'hello from browzat\n');
+      r = await call('upload', { tab: ptab, selector: '#file', files: [tmp] });
+      const up = await read('fileOut');
+      check('upload a file into a file input', up === 'files: browzat-e2e-upload.txt:19', up + ' | ' + r.text);
+      r = await call('upload', { tab: ptab, selector: '#file', files: [tmp + '.missing'] });
+      check('upload reports a missing file', r.isError && /file not found/.test(r.text), r.text);
+      fs.unlinkSync(tmp);
+
+      r = await call('click', { tab: ptab, selector: '#ask' });
+      check('a confirm is dismissed by default and reported', (await read('dlgOut')) === 'confirm=false' && /dialog: confirm "Delete it\?" -> dismissed/.test(r.text), r.text);
+      r = await call('dialog', { tab: ptab, action: 'accept' });
+      r = await call('click', { tab: ptab, selector: '#ask' });
+      check('dialog accept makes the next confirm return true', (await read('dlgOut')) === 'confirm=true', r.text);
+      await call('dialog', { tab: ptab, action: 'accept', text: 'Zed' });
+      r = await call('click', { tab: ptab, selector: '#pr' });
+      check('dialog accept answers a prompt with text', (await read('dlgOut')) === 'prompt=Zed', r.text);
+
+      r = await call('hover', { tab: ptab, selector: '#hov' });
+      check('hover fires mouseenter', (await read('hovOut')) === 'hovered', r.text);
+
+      r = await call('drag', { tab: ptab, from_selector: '#src', to_selector: '#dst' });
+      const dropped = await read('dropOut');
+      check('drag and drop (HTML5) carries the data', dropped === 'dropped payload-42', dropped + ' | ' + r.text);
+
+      const box = JSON.parse((await call('evaluate', { tab: ptab, code: "(() => { const e = document.getElementById('pad'); e.scrollIntoView({block:'center'}); const b = e.getBoundingClientRect(); return JSON.stringify({ x: b.left, y: b.top }); })()" })).text.trim());
+      r = await call('mouse', { tab: ptab, x: box.x + 30, y: box.y + 20 });
+      const pad = await read('padOut');
+      // ±1 px: Firefox rounds the coordinates of script-made mouse events to whole pixels.
+      const pm = /^pad click at (-?\d+),(-?\d+)$/.exec(pad);
+      check('mouse click at coordinates', !!pm && Math.abs(pm[1] - 30) <= 1 && Math.abs(pm[2] - 20) <= 1, pad + ' | ' + r.text);
+
+      await call('tabs', { action: 'close', tab: ptab });
     }
 
     // Handoff. Nobody clicks here, so this covers the card, its isolation, navigation, timeout and tab close.

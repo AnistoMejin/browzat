@@ -1,6 +1,6 @@
 {
   "name": "browser-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "browzat: local MCP server and browser extension that drive the user's own logged-in Chrome, Edge and Firefox profiles.",
   "keywords": [

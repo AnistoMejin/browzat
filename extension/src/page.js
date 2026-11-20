@@ -527,3 +527,269 @@ function bmcpHandoffCard(o) {
     return { ok: false, error: String((e && e.message) || e) };
   }
 }
+
+// Finds the element of a ref or selector, scrolls it into view and reports where it is, for real (debugger) input.
+// prepare: 'focus-select' focuses a text field and selects its content (so inserted text replaces it),
+// 'focus-end' focuses it with the caret at the end.
+function bmcpLocate(a) {
+  try {
+    const S = globalThis.__bmcp;
+    let el = null;
+    if (a.ref) {
+      el = S && S.els.get(a.ref);
+      if (!el || !el.isConnected) return { ok: false, error: 'ref ' + a.ref + ' is no longer on the page; take a new snapshot' };
+    } else if (a.selector) {
+      el = document.querySelector(a.selector);
+      if (!el) return { ok: false, error: 'selector matched nothing: ' + a.selector };
+    } else if (a.focused) {
+      el = document.activeElement;
+    }
+    if (!el) return { ok: false, error: 'ref or selector is required' };
+    const short = (s) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    const desc = (e) => {
+      if (!e || e === document.body || e === document.documentElement) return 'the page';
+      const field = /^(input|textarea|select)$/.test(e.localName);
+      const label = e.getAttribute('aria-label') || (field ? e.placeholder || e.name || e.id : e.innerText) || '';
+      return e.localName + (short(label) ? ' "' + short(label) + '"' : '');
+    };
+    if (!a.noscroll && el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2;
+    const y = r.top + r.height / 2;
+    const visible = r.width > 0 && r.height > 0 && x >= 0 && y >= 0 && x <= innerWidth && y <= innerHeight;
+    let hit = visible ? document.elementFromPoint(x, y) : null;
+    while (hit && hit.shadowRoot) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    const reachable = !!hit && (hit === el || el.contains(hit));
+    const tag = el.localName;
+    const textField = (tag === 'input' && !/^(checkbox|radio|file|button|submit|reset|image|range|color)$/i.test(el.type)) || tag === 'textarea' || !!el.isContentEditable;
+    if (a.prepare && textField) {
+      if (el.disabled || el.readOnly) return { ok: false, error: 'the field is disabled or read-only' };
+      el.focus({ preventScroll: true });
+      if (el.isContentEditable) {
+        const sel = getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        if (a.prepare === 'focus-end') range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } else if (a.prepare === 'focus-select') {
+        el.select();
+      } else {
+        const n = el.value.length;
+        try { el.setSelectionRange(n, n); } catch (e) {}
+      }
+    }
+    if (a.focus && !a.prepare && typeof el.focus === 'function') el.focus({ preventScroll: true });
+    return {
+      ok: true,
+      value: {
+        x, y, visible, reachable, desc: desc(el), cover: reachable || !hit ? '' : desc(hit),
+        tag, type: el.type || '', textField, disabled: !!el.disabled, isFile: tag === 'input' && el.type === 'file',
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+// Upload helper. op 'find' resolves the file input for a target (the input itself, a label's control, an input inside
+// it, or the only file input on the page) and, with mark, tags it so the debugger can find it. op 'unmark' removes the
+// tag. op 'set' (Firefox) puts files given as base64 on the input and fires input and change.
+function bmcpFiles(a) {
+  try {
+    const ATTR = 'data-bmcp-upload';
+    if (a.op === 'unmark') {
+      for (const e of document.querySelectorAll('[' + ATTR + ']')) e.removeAttribute(ATTR);
+      return { ok: true, value: true };
+    }
+    const S = globalThis.__bmcp;
+    let el = null;
+    if (a.ref) {
+      el = S && S.els.get(a.ref);
+      if (!el || !el.isConnected) return { ok: false, error: 'ref ' + a.ref + ' is no longer on the page; take a new snapshot' };
+    } else if (a.selector) {
+      el = document.querySelector(a.selector);
+      if (!el) return { ok: false, error: 'selector matched nothing: ' + a.selector };
+    }
+    const isFile = (e) => !!e && e.localName === 'input' && e.type === 'file';
+    let input = null;
+    if (isFile(el)) input = el;
+    else if (el && el.control && isFile(el.control)) input = el.control;
+    else if (el && el.querySelector && isFile(el.querySelector('input[type=file]'))) input = el.querySelector('input[type=file]');
+    else {
+      const all = document.querySelectorAll('input[type=file]');
+      if (all.length === 1) input = all[0];
+    }
+    if (!input) return { ok: true, value: { input: false } };
+    if (input.disabled) return { ok: false, error: 'the file input is disabled' };
+    if (a.op === 'find') {
+      if (a.mark) input.setAttribute(ATTR, a.mark);
+      return { ok: true, value: { input: true, multiple: !!input.multiple, accept: input.accept || '' } };
+    }
+    if (a.op === 'set') {
+      if (a.files.length > 1 && !input.multiple) return { ok: false, error: 'this file input takes one file only' };
+      const dt = new DataTransfer();
+      for (const f of a.files) {
+        const bin = atob(f.data);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        dt.items.add(new File([bytes], f.name, { type: f.type || '', lastModified: f.mtime || Date.now() }));
+      }
+      input.files = dt.files;
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, value: { count: input.files.length } };
+    }
+    return { ok: false, error: 'unknown op ' + a.op };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+// Answers alert / confirm / prompt in agent tabs so the page never blocks, and records each one. Runs in the page's
+// own world on Chrome and Edge, and in the content-script world on Firefox (through exportFunction). Default answers:
+// alert OK, confirm Cancel, prompt Cancel; op 'arm' sets the answer for the next dialog. op 'take' returns the record.
+function bmcpDialogs(o) {
+  try {
+    const FF = typeof exportFunction === 'function' && window.wrappedJSObject;
+    const G = globalThis.__bmcpDlg || (globalThis.__bmcpDlg = { log: [], arm: null, installed: false });
+    const handle = (kind, msg, def) => {
+      const arm = G.arm;
+      if (arm && !arm.keep) G.arm = null;
+      const accept = arm ? arm.action === 'accept' : kind === 'alert';
+      let ret;
+      if (kind === 'confirm') ret = accept;
+      else if (kind === 'prompt') ret = accept ? String(arm && arm.text != null ? arm.text : def == null ? '' : def) : null;
+      const entry = { kind, message: String(msg == null ? '' : msg).slice(0, 300), answer: accept ? (kind === 'alert' ? 'ok' : 'accepted') : 'dismissed' };
+      if (kind === 'prompt' && accept) entry.text = ret;
+      G.log.push(entry);
+      if (G.log.length > 20) G.log.shift();
+      return ret;
+    };
+    if (!G.installed) {
+      if (FF) {
+        const w = window.wrappedJSObject;
+        exportFunction(function (m) { handle('alert', m); }, w, { defineAs: 'alert' });
+        exportFunction(function (m) { return handle('confirm', m); }, w, { defineAs: 'confirm' });
+        exportFunction(function (m, d) { return handle('prompt', m, d); }, w, { defineAs: 'prompt' });
+      } else {
+        window.alert = function (m) { handle('alert', m); };
+        window.confirm = function (m) { return handle('confirm', m); };
+        window.prompt = function (m, d) { return handle('prompt', m, d); };
+      }
+      G.installed = true;
+    }
+    if (o.op === 'arm') G.arm = { action: o.action === 'accept' ? 'accept' : 'dismiss', text: o.text, keep: !!o.keep };
+    if (o.op === 'take') {
+      const l = G.log;
+      G.log = [];
+      return { ok: true, value: l };
+    }
+    return { ok: true, value: { armed: G.arm } };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+// Simulated pointer input for Firefox, and the fallback elsewhere: hover, drag (HTML5 and mouse based), and mouse
+// actions at viewport coordinates.
+function bmcpPointer(a) {
+  try {
+    const S = globalThis.__bmcp;
+    const find = (ref, selector) => {
+      if (ref) {
+        const e = S && S.els.get(ref);
+        if (!e || !e.isConnected) throw new Error('ref ' + ref + ' is no longer on the page; take a new snapshot');
+        return e;
+      }
+      if (selector) {
+        const e = document.querySelector(selector);
+        if (!e) throw new Error('selector matched nothing: ' + selector);
+        return e;
+      }
+      return null;
+    };
+    const center = (e) => {
+      e.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      const r = e.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    };
+    const base = (p, extra) => Object.assign({ bubbles: true, cancelable: true, composed: true, view: window, clientX: p.x, clientY: p.y }, extra);
+    const mouse = (t, type, p, extra) => t.dispatchEvent(new MouseEvent(type, base(p, extra)));
+    const ptr = (t, type, p, extra) => t.dispatchEvent(new PointerEvent(type, base(p, Object.assign({ pointerType: 'mouse', isPrimary: true }, extra))));
+    const at = (p) => document.elementFromPoint(p.x, p.y) || document.body;
+
+    if (a.action === 'hover') {
+      const el = find(a.ref, a.selector);
+      if (!el) throw new Error('hover needs ref or selector');
+      const p = center(el);
+      ptr(el, 'pointerover', p);
+      ptr(el, 'pointerenter', p, { bubbles: false });
+      mouse(el, 'mouseover', p);
+      mouse(el, 'mouseenter', p, { bubbles: false });
+      ptr(el, 'pointermove', p);
+      mouse(el, 'mousemove', p);
+      return { ok: true, value: 'hovered (simulated)' };
+    }
+    if (a.action === 'drag') {
+      const src = find(a.from_ref, a.from_selector);
+      const dst = find(a.to_ref, a.to_selector);
+      if (!src || !dst) throw new Error('drag needs a source and a target');
+      const p1 = center(src);
+      const p2 = center(dst);
+      const dt = new DataTransfer();
+      const drag = (t, type, p) => t.dispatchEvent(new DragEvent(type, base(p, { dataTransfer: dt })));
+      ptr(src, 'pointerdown', p1, { buttons: 1 });
+      mouse(src, 'mousedown', p1, { buttons: 1 });
+      drag(src, 'dragstart', p1);
+      ptr(dst, 'pointermove', p2, { buttons: 1 });
+      mouse(dst, 'mousemove', p2, { buttons: 1 });
+      drag(dst, 'dragenter', p2);
+      drag(dst, 'dragover', p2);
+      drag(dst, 'drop', p2);
+      drag(src, 'dragend', p2);
+      ptr(dst, 'pointerup', p2);
+      mouse(dst, 'mouseup', p2);
+      return { ok: true, value: 'dragged (simulated)' };
+    }
+    if (a.action === 'mouse') {
+      const p = { x: Number(a.x) || 0, y: Number(a.y) || 0 };
+      const t = at(p);
+      const button = a.button === 'right' ? 2 : a.button === 'middle' ? 1 : 0;
+      if (a.op === 'move') {
+        ptr(t, 'pointermove', p);
+        mouse(t, 'mousemove', p);
+      } else if (a.op === 'down') {
+        ptr(t, 'pointerdown', p, { button, buttons: 1 });
+        mouse(t, 'mousedown', p, { button, buttons: 1 });
+      } else if (a.op === 'up') {
+        ptr(t, 'pointerup', p, { button });
+        mouse(t, 'mouseup', p, { button });
+      } else if (a.op === 'wheel') {
+        t.dispatchEvent(new WheelEvent('wheel', base(p, { deltaX: Number(a.delta_x) || 0, deltaY: Number(a.delta_y) || 0 })));
+        window.scrollBy(Number(a.delta_x) || 0, Number(a.delta_y) || 0);
+      } else {
+        ptr(t, 'pointerdown', p, { button, buttons: 1 });
+        mouse(t, 'mousedown', p, { button, buttons: 1 });
+        ptr(t, 'pointerup', p, { button });
+        mouse(t, 'mouseup', p, { button });
+        if (button === 2) mouse(t, 'contextmenu', p, { button });
+        else {
+          mouse(t, 'click', p, { button, detail: 1 });
+          if (a.double) {
+            mouse(t, 'click', p, { detail: 2 });
+            mouse(t, 'dblclick', p, { detail: 2 });
+          }
+        }
+      }
+      return { ok: true, value: (a.op || 'click') + ' at ' + Math.round(p.x) + ',' + Math.round(p.y) + ' on ' + String(t.localName || 'page') + ' (simulated)' };
+    }
+    throw new Error('unknown pointer action ' + a.action);
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}

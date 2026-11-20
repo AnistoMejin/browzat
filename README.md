@@ -131,6 +131,12 @@ Installs to `%USERPROFILE%\.mcp-servers\browser-mcp`. Options: `-Dir <folder>`, 
 ```
 
 Installs to `~/browser-mcp`. Options: `--dir <folder>`, `--pair`, `--no-claude`.
+No sudo is needed. If Node.js came without npm (Ubuntu's `apt install nodejs` does), the installer fetches the one
+dependency, `ws`, straight from the npm registry at the version pinned in `package-lock.json` and checks its sha512.
+
+On Ubuntu 23.10 and newer, AppArmor blocks the sandbox of Chromium builds that are not installed as system packages
+(for example Playwright's Chrome for Testing): they exit with "No usable sandbox". Google Chrome, Chromium and
+Firefox installed from the distribution's packages are not affected.
 The Linux default is a visible folder because Snap and Flatpak browsers cannot read hidden folders in the home directory.
 
 The installer does all of this:
@@ -183,13 +189,29 @@ press **Save and connect**. The name then stays with that profile.
 | `tabs` | `list`, `new`, `close`, `activate`; in Firefox also `containers` and `new` with `container` |
 | `navigate` | Go to a URL, back, forward, reload |
 | `snapshot` | Read the page as a compact text outline; interactive elements get refs such as `[e12]` |
-| `click` | Click by ref or CSS selector |
-| `type` | Fill a field, or choose an option of a select; `submit` presses Enter |
+| `click` | Click by ref or CSS selector; `double`, `button` (left, right, middle) |
+| `type` | Fill a field, or choose an option of a select; `clear: false` appends; `submit` presses Enter |
 | `press_key` | Enter, Escape, Tab, arrows, PageDown, `Control+a` and so on |
+| `hover` | Move the mouse over an element (menus, tooltips) |
+| `drag` | Drag one element onto another (HTML5 drag and drop, sortable lists) |
+| `mouse` | Click, move, down, up or wheel at viewport coordinates (canvas, maps, sliders) |
+| `upload` | Put local files into a file input, or into the chooser a button opens |
+| `dialog` | Set the answer for the next alert / confirm / prompt |
 | `evaluate` | Run JavaScript in the page |
 | `wait_for` | Wait for text or a selector to appear or disappear |
 | `screenshot` | Capture the visible part of a tab |
 | `handoff` | Ask the user to do a step only a person can do (login, 2FA, passkey, captcha, a confirmation), then wait |
+
+**Real input:** on Chrome and Edge, clicks, typing, keys, hover, drag and mouse actions go through the browser's
+debugger API, so sites see them as real (trusted) input. The debugger attaches only while the agent acts and detaches
+after 8 seconds idle; while attached, the browser shows a bar "browzat started debugging this browser". Firefox has no
+debugger API for extensions, so there the input is simulated (most sites accept it; a few refuse simulated clicks).
+Simulated input is also used inside iframes, when another element covers the target, and when DevTools is open on
+the tab; the result says so.
+
+**Dialogs:** in tabs the agent works in, alert / confirm / prompt never block the page. Alerts are accepted and
+confirms and prompts are dismissed unless `dialog` set another answer before the action, and the action's result
+lists every dialog that appeared.
 
 **Handoff:** the tab comes to the front with a small card that shows the agent's message, the site, and **Continue**
 and **Cancel**. The tool returns when you click one of them, when the tab closes, or after `timeout_s` (default 300,
@@ -269,8 +291,17 @@ Helpers that start a browser with a throwaway profile and the extension already 
 ignores `--load-extension`) and `test/launch-chromium.js` (Edge and Chromium). `test/call.js <tool> '<json>'`
 calls a single tool. `test/mac-sim` is a small add-on that imitates Multi-Account Containers for the container tests.
 
-Tested on Windows 11 with Chrome 157, Edge 157 and Firefox 160. The Linux installer and the Linux browser
-start-up code have not been run on a Linux machine yet.
+Tested (0.4.0, 2026-11-21) with the full end-to-end suite:
+
+| System | Browsers | Result |
+|---|---|---|
+| Windows 11, real profiles | Chrome 157, Edge 157, Firefox 160 | all checks pass |
+| Ubuntu 24.04 server (Xvfb virtual display, throwaway profiles) | Chrome for Testing 159, Firefox 160.0.1 | all checks pass, repeated runs on fresh profiles |
+| Ubuntu 24.04 | two Chromium profiles connected at once (`chromium`, `chromium-2`) | all checks pass on both |
+
+On a server without a desktop, start a virtual display first (`Xvfb :99 &`, then `DISPLAY=:99`). A Chromium test
+build there needs `CHROME_EXTRA_ARGS=--no-sandbox` for `test/launch-chromium.js` (see the AppArmor note above);
+`FIREFOX_BIN` points `test/launch-firefox.js` at a Firefox that is not in the default Windows location.
 
 ## Uninstall
 

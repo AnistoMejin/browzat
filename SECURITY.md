@@ -23,6 +23,13 @@ Only the latest version on `main` receives fixes.
 | Web pages cannot use the relay | Requests with a web `Origin` or an unexpected `Host` are refused. |
 | Agent scope | The agent sees and closes only tabs it opened unless told otherwise; password field values are never returned by `snapshot`. |
 
+## Permissions
+
+The Chrome and Edge extension uses the `debugger` permission (since 0.4.0) for real input and uploads. It attaches
+only to the tab the agent is acting in, only for the duration of the action plus 8 seconds, and the browser shows its
+"started debugging this browser" bar whenever it is attached. `upload` can read any local file the agent names; the
+agent decides which files go to which site, so connect only agents you trust.
+
 ## What it does not protect against
 
 - Other software running under your user account can read the token file and drive your browsers.
