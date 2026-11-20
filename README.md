@@ -1,8 +1,81 @@
-# Browser MCP
+# browzat
 
 Lets an AI agent (Claude Code or any other MCP client) drive **your own, logged-in browser profiles** in
 Chrome, Edge and Firefox. Nothing is launched in a clean profile: the agent works in the browser you already
 use, with your sessions, and you can watch it.
+
+The project is published as **browzat**. Inside the code it still uses its working name **Browser MCP**
+(`browser-mcp`), so the folders, the MCP entry, the extension name and the environment variables keep that name.
+The table below maps one to the other.
+
+## Names and locations
+
+| What | Name or path |
+|---|---|
+| GitHub repository | `https://github.com/AnistoMejin/browzat` (private) |
+| Source folder (clone, edit, commit here) | anywhere; on the original PC `C:\Entelegen\Projects\browser-mcp` |
+| Install folder (what the browsers and the agent load) | Windows `%USERPROFILE%\.mcp-servers\browser-mcp`, Linux `~/browser-mcp` |
+| Data folder (pairing token, `relay.log`, screenshots) | `~/.browser-mcp` (`%USERPROFILE%\.browser-mcp` on Windows) |
+| MCP server name in Claude Code | `browser-mcp` (user level); tools appear as `mcp__browser-mcp__<tool>` |
+| npm package name | `browser-mcp` (`package.json`, private, not published) |
+| Extension name in the browser | **Browser MCP Bridge**; Firefox add-on id `browser-mcp-bridge@local` |
+| Relay address | `127.0.0.1:19789` |
+| Environment variables | `BROWSER_MCP_PORT`, `BROWSER_MCP_HOME`, `BROWSER_MCP_TZ` |
+
+Edit only the source folder. The installer copies it to the install folder; never edit the install folder by hand.
+
+## Project structure
+
+```
+browzat/                         (source folder; the repository root)
+├── README.md                    this file
+├── CHANGELOG.md                 what changed in each version
+├── SECURITY.md                  how to report a vulnerability; the security model
+├── LICENSE                      MIT
+├── package.json                 name, version (also used as the extension version), npm scripts, one dependency: ws
+├── package-lock.json
+├── .gitignore                   node_modules/, dist/, *.log, .env
+├── .gitattributes               line endings: LF for install.sh, CRLF for install.ps1
+├── .editorconfig                editor settings: UTF-8, 2-space indent, final newline
+├── .github/workflows/ci.yml     CI: npm run check on Linux and Windows, Node 20 and 22
+├── install.ps1                  Windows installer: copy → npm install → build → register MCP → restart relay → reload extensions
+├── install.sh                   the same for Linux (not yet run on a real Linux machine)
+│
+├── server/                      Node.js side, runs on your computer
+│   ├── common.js                shared settings: port, data folder, token file, logging helpers, relay start-up
+│   ├── relay.js                 background daemon on 127.0.0.1; extensions connect over WebSocket (/ext),
+│   │                            MCP processes call POST /rpc; mutual HMAC check of the pairing token
+│   ├── mcp.js                   the MCP server the agent starts (stdio); defines the tools and forwards each call
+│   └── cli.js                   start | stop | status | pair | reload | copy-token
+│
+├── extension/                   browser side, one codebase for all three browsers
+│   ├── build.js                 builds dist/chromium (Manifest V3) and dist/firefox (Manifest V2)
+│   ├── manifest.chromium.json   manifest template for Chrome and Edge
+│   ├── manifest.firefox.json    manifest template for Firefox (adds containers and cookies permissions)
+│   └── src/
+│       ├── core.js              background logic: connect to the relay, pairing, run the tools it sends
+│       ├── page.js              functions injected into web pages: snapshot, click, type, keys, wait
+│       ├── sw.js                Chrome/Edge service-worker entry; loads page.js and core.js
+│       ├── popup.html           toolbar popup: profile name, relay port, manual token, Save and connect, Unpair
+│       └── popup.js
+│
+├── test/                        tests and helpers (copied to the install folder too, so tests run there)
+│   ├── check.js                 no-browser checks: JS syntax, JSON, build, manifest version (npm run check)
+│   ├── e2e.js                   end-to-end test through the real MCP server against a local test page
+│   ├── call.js                  call a single tool: node test/call.js <tool> '<json>'
+│   ├── launch-firefox.js        throwaway Firefox with the add-on loaded (WebDriver BiDi)
+│   ├── launch-chrome-pipe.js    throwaway Chrome with the extension loaded (DevTools pipe)
+│   ├── launch-chromium.js       throwaway Edge / Chromium with the extension loaded
+│   └── mac-sim/                 tiny add-on that imitates Firefox Multi-Account Containers for tests
+│
+└── .env                         local secrets such as a GitHub token (git-ignored; never commit)
+
+Not in the source folder, made by the installer in the install folder:
+  node_modules/                  the ws dependency (npm install)
+  dist/chromium/, dist/firefox/  the built extensions that the browsers load (extension/build.js)
+```
+
+## How it works
 
 It has three parts, all on your own computer:
 
@@ -25,6 +98,13 @@ agent  ──stdio──>  mcp.js  ──HTTP on 127.0.0.1──>  relay.js  <�
 ## Install
 
 Clone this repository anywhere, then run the installer. Run it again after every `git pull`; it is safe to repeat.
+
+```bash
+git clone https://github.com/AnistoMejin/browzat.git
+cd browzat
+```
+
+The repository is private, so cloning needs a GitHub login or a token with read access.
 
 **Windows**
 
@@ -82,7 +162,7 @@ Pairing is needed once per browser profile.
 ### Give each profile a name
 
 Two profiles of the same browser get the names `chrome` and `chrome-2` in the order they connect, so the names
-can swap after a restart. Click the Browser MCP icon in each profile, type a name such as `chrome-work`, and
+can swap after a restart. Click the Browser MCP Bridge icon in each profile, type a name such as `chrome-work`, and
 press **Save and connect**. The name then stays with that profile.
 
 ## Tools
@@ -135,6 +215,8 @@ Firefox, while it runs a temporary add-on, may need **Reload** pressed once in `
 
 ## Security
 
+Full model and how to report a problem: [SECURITY.md](SECURITY.md).
+
 - The relay listens on `127.0.0.1` only.
 - A 256-bit token is created on first start and stored in `~/.browser-mcp/token`. The extension and the relay
   each prove to the other that they know it (HMAC challenge in both directions) before any command is accepted.
@@ -153,6 +235,9 @@ Firefox, while it runs a temporary add-on, may need **Reload** pressed once in `
 - Only the top page is read by default; pass `frames: true` to `snapshot` to include iframes.
 
 ## Tests
+
+`npm run check` needs no browser: it checks the syntax of every JavaScript file, parses every JSON file, builds the
+extension and confirms the built manifests carry the package version. CI runs it on every push.
 
 `test/e2e.js` drives a local test page through the real MCP server:
 
@@ -178,3 +263,7 @@ node <install folder>/server/cli.js stop
 ```
 
 Then remove the extension in each browser and delete the install folder and `~/.browser-mcp`.
+
+## License
+
+[MIT](LICENSE). Changes are listed in [CHANGELOG.md](CHANGELOG.md).

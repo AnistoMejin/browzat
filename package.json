@@ -2,12 +2,34 @@
   "name": "browser-mcp",
   "version": "0.2.0",
   "private": true,
-  "description": "Local MCP server and browser extension that drive the user's own logged-in Chrome, Edge and Firefox profiles.",
+  "description": "browzat: local MCP server and browser extension that drive the user's own logged-in Chrome, Edge and Firefox profiles.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "browser-automation",
+    "browser-extension",
+    "chrome",
+    "edge",
+    "firefox",
+    "claude-code"
+  ],
+  "license": "MIT",
+  "author": "Anisto Mejin",
+  "homepage": "https://github.com/AnistoMejin/browzat#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AnistoMejin/browzat.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AnistoMejin/browzat/issues"
+  },
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "build": "node extension/build.js",
+    "check": "node test/check.js",
+    "test": "node test/check.js",
     "start": "node server/cli.js start",
     "status": "node server/cli.js status",
     "pair": "node server/cli.js pair",

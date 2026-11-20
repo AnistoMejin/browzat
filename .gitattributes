@@ -1,0 +1,12 @@
+# Store text with LF in the repository; check out with the platform default.
+* text=auto
+
+# Shell scripts must keep LF everywhere, or bash on Linux fails on the CR.
+*.sh text eol=lf
+
+# PowerShell scripts keep CRLF for Windows PowerShell 5.1.
+*.ps1 text eol=crlf
+
+*.png binary
+*.jpg binary
+*.ico binary
