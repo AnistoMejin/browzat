@@ -66,6 +66,7 @@ browzat/                         (source folder; the repository root)
 │       ├── core.js              background logic: connect to the relay, pairing, run the tools it sends
 │       ├── page.js              functions injected into web pages: snapshot, click, type, keys, wait
 │       ├── sw.js                Chrome/Edge service-worker entry; loads page.js and core.js
+│       ├── early.js             Firefox: starts the console recorder with each page, removes it from non-agent tabs
 │       ├── popup.html           toolbar popup: profile name, relay port, manual token, Save and connect, Unpair
 │       └── popup.js
 │
@@ -197,6 +198,19 @@ press **Save and connect**. The name then stays with that profile.
 | `mouse` | Click, move, down, up or wheel at viewport coordinates (canvas, maps, sliders) |
 | `upload` | Put local files into a file input, or into the chooser a button opens |
 | `dialog` | Set the answer for the next alert / confirm / prompt |
+| `network_requests` | List a tab's requests (filter by URL, type, failed); `bodies: true` starts recording response bodies |
+| `network_request` | One request in detail: headers both ways, request body, response body |
+| `network_route` | Block or mock requests by URL pattern; list, remove, clear |
+| `network_conditions` | Chrome and Edge: offline, latency, slow download and upload |
+| `console_messages` | Console output, uncaught errors, unhandled rejections, failed loads |
+
+**Network and console:** requests are recorded in the tabs the agent opened (and in a tab of yours only after the
+agent calls `network_requests` on it), at most the newest 500 per tab, in memory, dropped when the tab closes. URL
+patterns are a substring, a glob with `*`, or `/regex/flags`. Response bodies are recorded only after
+`bodies: true` (up to 1 MB each). Chrome and Edge show the debugging bar while bodies, routes or network conditions are
+on. On Firefox, mocks keep the server's status code (Firefox cannot change it) and network conditions are not
+available. The console on Chrome and Edge includes everything since the page started, even from before the agent
+looked; on Firefox it covers pages opened or navigated in agent tabs.
 | `evaluate` | Run JavaScript in the page |
 | `wait_for` | Wait for text or a selector to appear or disappear |
 | `screenshot` | Capture the visible part of a tab |

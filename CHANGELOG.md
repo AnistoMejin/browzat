@@ -5,6 +5,36 @@ the version in `package.json` is also the extension version.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-21
+
+Phase 2 of the all-in-one roadmap: network and console.
+
+- New tools:
+  - `network_requests`: the requests a tab made (method, status, type, duration, URL, a number for details), with
+    filters (URL substring, glob or /regex/, types, failed only), static files hidden unless asked, and `bodies: true`
+    to start recording response bodies.
+  - `network_request`: one request in detail: request and response headers, request body, response body.
+  - `network_route`: block requests, or answer them with a mock (status, body, content type, headers), by URL pattern;
+    list, remove and clear routes, with hit counts.
+  - `network_conditions` (Chrome and Edge): offline, latency, download and upload speed; reset.
+  - `console_messages`: console output plus uncaught errors, unhandled promise rejections and failed loads, filtered
+    by level, with `clear`.
+- How it works: the request log uses the browsers' webRequest API, so it needs no debugger. Response bodies, routes
+  and network conditions use the debugger on Chrome and Edge (the debugging bar stays while they are on), and
+  webRequest response filters on Firefox (Firefox keeps the server's status code for mocks). The console comes from the
+  debugger on Chrome and Edge, which replays the page's whole history; on Firefox a recorder starts with each page.
+- Privacy: requests and console messages are recorded only in tabs the agent opened, or tabs it was explicitly asked
+  to watch. On Firefox a tiny recorder starts in every page (to catch a page's first messages) and removes itself at
+  once from tabs the agent does not work in, leaving the page's console as it was.
+- The dialog guard now installs as each agent page starts, so alerts during page load no longer block.
+- Tabs the agent opens are marked as the agent's the moment the browser creates them, so their first request is
+  recorded too.
+- Chrome and Edge ask for `webRequest` and `webNavigation`; Firefox also for `webRequestBlocking`.
+- `npm run check` now unit-tests the URL patterns used by filters and routes (a path such as `/api/data` is plain text,
+  not a regex).
+- Tests: 21 new end-to-end checks; all pass on Windows (Chrome, Edge, Firefox, real profiles) and Ubuntu 24.04
+  (Chromium, Firefox).
+
 ## [0.4.0] - 2026-11-21
 
 Phase 1 of the all-in-one roadmap: real input, uploads and dialogs.
@@ -68,7 +98,8 @@ First published version.
 - Windows installer (`install.ps1`) and Linux installer (`install.sh`, not yet tested on Linux).
 - End-to-end tests on real and throwaway profiles.
 
-[Unreleased]: https://github.com/AnistoMejin/browzat/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/AnistoMejin/browzat/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/AnistoMejin/browzat/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/AnistoMejin/browzat/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AnistoMejin/browzat/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AnistoMejin/browzat/releases/tag/v0.2.0

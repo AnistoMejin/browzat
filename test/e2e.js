@@ -32,6 +32,12 @@ const FORM = `<!doctype html><html><head><meta charset="utf-8"><title>BMCP test<
 <div id="src" draggable="true" style="display:inline-block;padding:8px;background:#ddd">Drag me</div>
 <div id="dst" style="display:inline-block;padding:20px;border:2px dashed #888">Drop here</div> <span id="dropOut">not dropped</span>
 <div id="pad" style="width:120px;height:60px;background:#cde">Mouse pad</div> <span id="padOut">no mouse</span>
+<button id="load">Load data</button> <button id="failb">Load failing</button> <button id="post">Post data</button> <span id="netOut">no data</span>
+<script>
+document.getElementById('load').addEventListener('click', () => fetch('/api/data').then((r) => r.json()).then((j) => { document.getElementById('netOut').textContent = 'data=' + j.answer; }).catch(() => { document.getElementById('netOut').textContent = 'fetch failed'; }));
+document.getElementById('failb').addEventListener('click', () => fetch('/api/fail').then((r) => { document.getElementById('netOut').textContent = 'status=' + r.status; }).catch(() => { document.getElementById('netOut').textContent = 'fetch failed'; }));
+document.getElementById('post').addEventListener('click', () => fetch('/api/echo', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'name=zed&n=1' }).then((r) => r.text()).then((t) => { document.getElementById('netOut').textContent = t; }));
+</script>
 <script>
 const $ = (id) => document.getElementById(id);
 $('real').addEventListener('click', (e) => { $('realOut').textContent = 'click trusted=' + e.isTrusted; });
@@ -54,9 +60,32 @@ document.getElementById('late').addEventListener('click', () => setTimeout(() =>
 </script></body></html>`;
 const SECOND = '<!doctype html><html><head><meta charset="utf-8"><title>Second</title></head><body><h1>Second page content</h1><p style="margin-top:3000px">bottom</p></body></html>';
 
+const CONSOLE_PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>Console test</title></head><body><h1>Console test</h1>
+<script>
+console.log('hello-log', { a: 1 });
+console.warn('careful-warn');
+console.error('bad-thing-error');
+Promise.reject(new Error('nobody-caught-me'));
+setTimeout(() => { throw new Error('boom-uncaught'); }, 50);
+</script></body></html>`;
+
 const pages = http.createServer((req, res) => {
+  if (req.url.startsWith('/api/data')) {
+    res.writeHead(200, { 'content-type': 'application/json', 'x-test': 'browzat' });
+    return res.end('{"answer":42}');
+  }
+  if (req.url.startsWith('/api/fail')) {
+    res.writeHead(500, { 'content-type': 'text/plain' });
+    return res.end('server exploded');
+  }
+  if (req.url.startsWith('/api/echo')) {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('echo:' + body); });
+    return undefined;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-  res.end(req.url.startsWith('/second') ? SECOND : FORM);
+  res.end(req.url.startsWith('/second') ? SECOND : req.url.startsWith('/console') ? CONSOLE_PAGE : FORM);
 });
 
 const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'mcp.js')], { stdio: ['pipe', 'pipe', 'inherit'] });
@@ -109,7 +138,7 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
     const init = await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
     mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
     const tools = await request('tools/list', {});
-    check('MCP handshake and tool list', init.result.serverInfo.name === 'browser-mcp' && tools.result.tools.length === 16, JSON.stringify(init.result));
+    check('MCP handshake and tool list', init.result.serverInfo.name === 'browser-mcp' && tools.result.tools.length === 21, JSON.stringify(init.result));
 
     let r = await call('status', {});
     check(`status lists ${browser}`, new RegExp('^' + browser + '\\b', 'm').test(r.text), r.text);
@@ -275,6 +304,93 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
       check('mouse click at coordinates', !!pm && Math.abs(pm[1] - 30) <= 1 && Math.abs(pm[2] - 20) <= 1, pad + ' | ' + r.text);
 
       await call('tabs', { action: 'close', tab: ptab });
+    }
+
+    // Phase 2: network log, request details and bodies, routes, network conditions, console.
+    {
+      const chromium = browser !== 'firefox' && !/^firefox/.test(browser);
+      r = await call('tabs', { action: 'new', browser, url: base + '/form' });
+      const ntab = (/^tab: (\S+)/m.exec(r.text) || [])[1];
+      const out = async () => (await call('evaluate', { tab: ntab, code: "document.getElementById('netOut').textContent" })).text.trim();
+      const waitOut = async (want) => { let v = ''; for (let i = 0; i < 15; i++) { v = await out(); if (want.test(v)) break; await new Promise((res) => setTimeout(res, 200)); } return v; };
+      const numOf = (txt, re) => { const m = new RegExp('^#(\\d+) ' + re.source, 'm').exec(txt); return m ? Number(m[1]) : null; };
+
+      await call('click', { tab: ntab, selector: '#load' });
+      check('fetch through the page works', (await waitOut(/data=/)) === 'data=42', await out());
+      r = await call('network_requests', { tab: ntab });
+      const dataN = numOf(r.text, /GET 200 xmlhttprequest \S+\/api\/data/);
+      check('network_requests lists the fetch with status and type', dataN != null, r.text);
+      check('network_requests lists the page itself', /GET 200 main_frame \S+\/form/.test(r.text), r.text);
+      r = await call('network_request', { tab: ntab, request: dataN });
+      check('network_request shows response headers', /x-test: browzat/i.test(r.text) && /content-type: application\/json/i.test(r.text), r.text);
+      check('network_request says bodies are not recorded yet', /bodies are not being recorded/.test(r.text), r.text);
+
+      r = await call('network_requests', { tab: ntab, bodies: true });
+      check('network_requests bodies:true switches body recording on', /response bodies are now recorded/.test(r.text), r.text);
+      await call('click', { tab: ntab, selector: '#load' });
+      await waitOut(/data=42/);
+      await new Promise((res) => setTimeout(res, 500));
+      r = await call('network_requests', { tab: ntab, filter: '/api/data' });
+      const all = [...r.text.matchAll(/^#(\d+) GET 200/gm)].map((m) => Number(m[1]));
+      r = await call('network_request', { tab: ntab, request: all[all.length - 1] });
+      check('network_request shows the response body', /"answer":42/.test(r.text), r.text);
+
+      await call('click', { tab: ntab, selector: '#post' });
+      check('POST through the page works', (await waitOut(/echo:/)) === 'echo:name=zed&n=1', await out());
+      r = await call('network_requests', { tab: ntab, filter: '/api/echo' });
+      r = await call('network_request', { tab: ntab, request: numOf(r.text, /POST/) });
+      // Body recording was on for this request, so the exact body (field order kept) comes from the debugger on
+      // Chrome and Edge, and from the request bytes on Firefox.
+      check('network_request shows the exact request body', /request body:\nname=zed&n=1(\n|$)/.test(r.text), r.text);
+
+      await call('click', { tab: ntab, selector: '#failb' });
+      await waitOut(/status=/);
+      r = await call('network_requests', { tab: ntab, failed: true });
+      check('network_requests failed:true lists the HTTP 500', /GET 500 xmlhttprequest \S+\/api\/fail/.test(r.text) && !/\/api\/data/.test(r.text), r.text);
+      await call('network_requests', { tab: ntab, bodies: false });
+
+      r = await call('network_route', { tab: ntab, pattern: '*/api/data', body: '{"answer":7}' });
+      check('network_route adds a mock', /^route 1: mocking/.test(r.text), r.text);
+      await call('click', { tab: ntab, selector: '#load' });
+      check('the mocked response reaches the page', (await waitOut(/data=7/)) === 'data=7', await out());
+      r = await call('network_route', { tab: ntab, pattern: '/api/fail', block: true });
+      await call('click', { tab: ntab, selector: '#failb' });
+      check('a blocked request fails in the page', (await waitOut(/fetch failed/)) === 'fetch failed', await out());
+      r = await call('network_route', { tab: ntab, action: 'list' });
+      check('network_route list shows both routes with hits', /route 1: mock 200 "\*\/api\/data" \(1 hit/.test(r.text) && /route 2: block "\/api\/fail" \(1 hit/.test(r.text), r.text);
+      r = await call('network_route', { tab: ntab, action: 'clear' });
+      await call('click', { tab: ntab, selector: '#load' });
+      check('after clear the real response is back', (await waitOut(/data=42/)) === 'data=42', await out());
+
+      r = await call('network_conditions', { tab: ntab, offline: true });
+      if (chromium) {
+        check('network_conditions offline', /now offline/.test(r.text), r.text);
+        await call('click', { tab: ntab, selector: '#load' });
+        check('offline makes the fetch fail', (await waitOut(/fetch failed/)) === 'fetch failed', await out());
+        await call('network_conditions', { tab: ntab, reset: true });
+        await call('click', { tab: ntab, selector: '#load' });
+        check('reset brings the network back', (await waitOut(/data=42/)) === 'data=42', await out());
+      } else {
+        check('network_conditions explains it is not available in Firefox', r.isError && /not available in Firefox/.test(r.text), r.text);
+      }
+
+      await call('navigate', { tab: ntab, url: base + '/console' });
+      // The page throws from a 50 ms timer, but agent tabs sit in the background, where browsers delay timers (Firefox
+      // to about a second): wait for that error to arrive, up to 4 s.
+      for (let i = 0; i < 20; i++) {
+        await new Promise((res) => setTimeout(res, 200));
+        r = await call('console_messages', { tab: ntab });
+        if (/boom-uncaught/.test(r.text)) break;
+      }
+      check('console_messages has log, warn and error', /\[log\] hello-log/.test(r.text) && /\[warn\] careful-warn/.test(r.text) && /\[error\] bad-thing-error/.test(r.text), r.text);
+      check('console_messages has the uncaught error and the unhandled rejection', /boom-uncaught/.test(r.text) && /nobody-caught-me/.test(r.text), r.text);
+      r = await call('console_messages', { tab: ntab, level: 'error' });
+      check('console_messages level:error hides log and warn', /bad-thing-error/.test(r.text) && !/hello-log/.test(r.text) && !/careful-warn/.test(r.text), r.text);
+      await call('console_messages', { tab: ntab, clear: true });
+      r = await call('console_messages', { tab: ntab });
+      check('console_messages clear hides earlier messages', /no console messages/.test(r.text), r.text);
+
+      await call('tabs', { action: 'close', tab: ntab });
     }
 
     // Handoff. Nobody clicks here, so this covers the card, its isolation, navigation, timeout and tab close.

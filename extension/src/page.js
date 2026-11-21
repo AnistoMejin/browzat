@@ -793,3 +793,109 @@ function bmcpPointer(a) {
     return { ok: false, error: String((e && e.message) || e) };
   }
 }
+
+// Console capture for Firefox (Chrome and Edge read the console through the debugger instead): wraps the page's
+// console methods with exportFunction, and records page errors and unhandled promise rejections.
+// op 'install' only installs; op 'take' returns the entries (and clears them with clear: true).
+function bmcpConsole(o) {
+  try {
+    const G = globalThis.__bmcpCon || (globalThis.__bmcpCon = { log: [], installed: false, since: Date.now() });
+    const text = (a) => {
+      if (typeof a === 'string') return a;
+      if (a === undefined) return 'undefined';
+      try {
+        const raw = typeof XPCNativeWrapper !== 'undefined' && a && typeof a === 'object' ? XPCNativeWrapper.unwrap(a) : a;
+        if (raw instanceof Error || (raw && raw.stack && raw.message)) return String(raw.name || 'Error') + ': ' + raw.message;
+        const s = JSON.stringify(raw);
+        return s === undefined ? String(raw) : s;
+      } catch (e) {
+        try { return String(a); } catch (e2) { return '[object]'; }
+      }
+    };
+    const push = (level, args, where) => {
+      if (G.off) return; // switched off in a tab the agent does not work in: pass-through only
+      // Never let recording break the page's own script.
+      try {
+        const parts = [];
+        for (let i = 0; i < args.length; i++) parts.push(text(args[i]));
+        G.log.push({ level, text: parts.join(' ').slice(0, 2000), ts: Date.now(), where: where || '' });
+        if (G.log.length > 500) G.log.shift();
+      } catch (e) {}
+    };
+    if (o.op === 'uninstall') {
+      // Not a tab the agent works in: put the page's console back and forget what was recorded.
+      if (G.installed) {
+        const w = typeof exportFunction === 'function' && window.wrappedJSObject;
+        const c = w ? w.console : console;
+        const same = (a, b) => {
+          try { return typeof XPCNativeWrapper !== 'undefined' ? XPCNativeWrapper.unwrap(a) === XPCNativeWrapper.unwrap(b) : a === b; } catch (e) { return false; }
+        };
+        for (const [level, orig] of Object.entries(G.orig || {})) {
+          // Put the original back only if our wrapper is still the one in place. If the site has wrapped it since,
+          // leave the site's chain alone; our layer turns into a plain pass-through (G.off).
+          try { if (same(c[level], G.fns[level])) c[level] = orig; } catch (e) {}
+        }
+        for (const [type, fn] of G.listeners || []) (w || window).removeEventListener(type, fn, true);
+      }
+      G.off = true;
+      G.log = [];
+      delete globalThis.__bmcpCon;
+      return { ok: true, value: true };
+    }
+    if (!G.installed) {
+      G.orig = {};
+      G.fns = {};
+      G.listeners = [];
+      const w = typeof exportFunction === 'function' && window.wrappedJSObject;
+      if (w) {
+        const c = w.console;
+        for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
+          const orig = c[level];
+          G.orig[level] = orig;
+          // Rest parameters give a content-script array; the page's `arguments` object is not readable from here.
+          const fn = exportFunction(function (...args) {
+            push(level, args);
+            return Function.prototype.apply.call(orig, c, args);
+          }, w);
+          c[level] = fn;
+          G.fns[level] = c[level];
+        }
+      } else {
+        for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
+          const orig = console[level];
+          G.orig[level] = orig;
+          console[level] = function () { push(level, arguments); return orig.apply(console, arguments); };
+          G.fns[level] = console[level];
+        }
+      }
+      const onError = (e) => {
+        try {
+          const t = e.target;
+          if (t && t.localName && t.localName !== 'html') {
+            push('error', ['Failed to load ' + t.localName + ': ' + (t.src || t.href || '')]);
+          } else {
+            push('error', ['Uncaught ' + (e.message || 'error')], e.filename ? e.filename + ':' + e.lineno : '');
+          }
+        } catch (err) {}
+      };
+      const onRejection = (e) => { try { push('error', ['Unhandled promise rejection: ' + text(e.reason)]); } catch (err) {} };
+      // On Firefox the listeners are added in the page's own world (exportFunction): Firefox stops delivering the
+      // page's later error events to listeners that live in the content-script world.
+      const target = w || window;
+      for (const [type, fn] of [['error', onError], ['unhandledrejection', onRejection]]) {
+        const h = w ? exportFunction(fn, w) : fn;
+        target.addEventListener(type, h, true);
+        G.listeners.push([type, h]);
+      }
+      G.installed = true;
+    }
+    if (o.op === 'take') {
+      const out = G.log.slice();
+      if (o.clear) G.log = [];
+      return { ok: true, value: { entries: out, since: G.since } };
+    }
+    return { ok: true, value: true };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}

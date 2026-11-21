@@ -44,6 +44,21 @@ for (const f of files.filter((f) => f.endsWith('.json'))) {
   check(`json    ${rel(f)}`, () => JSON.parse(fs.readFileSync(f, 'utf8')));
 }
 
+// URL patterns used by network_requests filters and network_route: substring, glob with *, or /regex/flags.
+check('unit    URL patterns (network filter and routes)', () => {
+  const core = fs.readFileSync(path.join(root, 'extension', 'src', 'core.js'), 'utf8');
+  const fn = /function patternRe\(p\) \{[\s\S]*?\n\}/.exec(core);
+  if (!fn) throw new Error('patternRe not found in core.js');
+  const patternRe = new Function(fn[0] + '; return patternRe;')();
+  const cases = [
+    ['/api/data', 'http://x/api/data', true], ['/api/data', 'http://x/api/fail', false], ['*/api/data', 'http://x/api/data', true],
+    ['*/api/data', 'http://x/api/data?x=1', false], ['/data\\?id=\\d+/', 'http://x/data?id=5', true], ['/API/i', 'http://x/api/z', true],
+    ['example.com', 'https://example.com/a', true], ['example.com', 'https://exampleXcom/a', false],
+  ];
+  const wrong = cases.filter(([p, u, want]) => patternRe(p).test(u) !== want).map(([p, u]) => p + ' vs ' + u);
+  if (wrong.length) throw new Error('wrong result for ' + wrong.join('; '));
+});
+
 const version = require(path.join(root, 'package.json')).version;
 check('build   extension/build.js', () => execFileSync(process.execPath, [path.join(root, 'extension', 'build.js')], { stdio: 'pipe' }));
 for (const target of ['chromium', 'firefox']) {

@@ -206,6 +206,86 @@ const TOOLS = [
     },
   },
   {
+    name: 'network_requests',
+    description: "List the requests a tab made: method, status, type, duration, URL, with a number to pass to network_request. Recorded for tabs you opened; calling it on another tab starts recording there. Static files (images, fonts, CSS, media) are hidden unless include_static. bodies: true starts recording response bodies for new requests (bodies: false stops).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        filter: { type: 'string', description: 'URL substring, glob with *, or /regex/.' },
+        type: { type: 'string', description: 'Comma list of types: main_frame, sub_frame, xmlhttprequest, script, stylesheet, image, font, media, websocket, other.' },
+        failed: { type: 'boolean', description: 'Only errors and HTTP status 400 or more.' },
+        include_static: { type: 'boolean' },
+        limit: { type: 'number', description: 'Newest N requests. Default 50.' },
+        bodies: { type: 'boolean' },
+        clear: { type: 'boolean', description: 'Empty the log first.' },
+      },
+      required: ['tab'],
+    },
+  },
+  {
+    name: 'network_request',
+    description: 'Details of one request from network_requests: request and response headers, request body, and the response body when bodies are being recorded.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        request: { type: 'number', description: 'The number shown by network_requests.' },
+        max_chars: { type: 'number', description: 'Cut the response body after this many characters. Default 20000.' },
+      },
+      required: ['tab', 'request'],
+    },
+  },
+  {
+    name: 'network_route',
+    description: "Block or mock requests in a tab by URL pattern (substring, glob with *, or /regex/). action add (default) with block: true, or with status/body/content_type/headers to answer with a mock; remove (by id or pattern), list, or clear. Firefox keeps the server's status code for mocks.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        action: { type: 'string', enum: ['add', 'remove', 'list', 'clear'] },
+        pattern: { type: 'string' },
+        block: { type: 'boolean' },
+        status: { type: 'number' },
+        body: { type: 'string' },
+        content_type: { type: 'string' },
+        headers: { type: 'object', description: 'Extra response headers, as name: value.' },
+        id: { type: 'number', description: 'remove: the route id.' },
+      },
+      required: ['tab'],
+    },
+  },
+  {
+    name: 'network_conditions',
+    description: 'Chrome and Edge: make a tab offline or slow (latency, download and upload speed) to test how a site behaves; reset: true goes back to normal. Not available in Firefox.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        offline: { type: 'boolean' },
+        latency_ms: { type: 'number' },
+        download_kbps: { type: 'number' },
+        upload_kbps: { type: 'number' },
+        reset: { type: 'boolean' },
+      },
+      required: ['tab'],
+    },
+  },
+  {
+    name: 'console_messages',
+    description: "The page's console messages and errors (uncaught exceptions, unhandled rejections, failed loads). Chrome and Edge return the whole history of the page; Firefox records from when the page started in a tab you opened. level: all (default), info, warn or error. clear: true hides these messages from later calls.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab: TAB,
+        level: { type: 'string', enum: ['all', 'info', 'warn', 'error'] },
+        limit: { type: 'number', description: 'Newest N messages. Default 100.' },
+        clear: { type: 'boolean' },
+      },
+      required: ['tab'],
+    },
+  },
+  {
     name: 'handoff',
     description:
       'Ask the user to do something only a person can do in a tab (log in, 2FA, passkey, captcha, payment or delete ' +
@@ -398,6 +478,41 @@ async function runTool(name, a) {
           },
         ],
       };
+    }
+    case 'network_requests': {
+      const lines = r.requests.map((e) => {
+        const st = e.error ? 'ERR ' + e.error : e.status ? String(e.status) : '...';
+        const extra = [e.ms != null ? e.ms + ' ms' : '', e.cache ? 'cache' : '', e.route ? 'route:' + e.route : '', e.redirect ? '-> ' + e.redirect : ''].filter(Boolean).join(', ');
+        const url = e.url.length > 200 ? e.url.slice(0, 200) + '…' : e.url;
+        return `#${e.n} ${e.method} ${st} ${e.type} ${url}${extra ? '  (' + extra + ')' : ''}`;
+      });
+      const head = `${r.shown} of ${r.total} request(s)` + (r.bodies ? ', bodies recorded' : '') + (r.routes ? `, ${r.routes} route(s) active` : '');
+      return text(head + (lines.length ? '\n' + lines.join('\n') : '') + (r.notes || []).map((x) => '\nnote: ' + x).join(''));
+    }
+    case 'network_request': {
+      const max = Math.min(Math.max(Number(a.max_chars) || 20000, 200), 200000);
+      const hdr = (list) => (list.length ? list.map(([k, v]) => `  ${k}: ${v}`).join('\n') : '  (none recorded)');
+      let out = `#${r.n} ${r.method} ${r.url}\nstatus: ${r.error ? 'ERR ' + r.error : r.statusLine || r.status || 'pending'}` +
+        `\ntype: ${r.type}${r.ms != null ? ', ' + r.ms + ' ms' : ''}${r.cache ? ', from cache' : ''}${r.ip ? ', ip ' + r.ip : ''}` +
+        (r.redirect ? `\nredirected to: ${r.redirect}` : '') + (r.route ? `\nroute: ${r.route}` : '') +
+        `\nrequest headers:\n${hdr(r.reqHeaders)}` + (r.reqBody ? `\nrequest body:\n${r.reqBody.slice(0, max)}` : '') +
+        `\nresponse headers:\n${hdr(r.resHeaders)}`;
+      if (r.body) {
+        if (r.body.binary) out += `\nresponse body: binary, ${r.body.size} bytes${r.body.mime ? ' (' + r.body.mime + ')' : ''}` + (r.body.b64 ? `\nbase64: ${r.body.b64.slice(0, max)}` : '');
+        else out += `\nresponse body (${r.body.size} bytes${r.body.truncated ? ', cut at 1 MB' : ''}):\n` + r.body.text.slice(0, max) + (r.body.text.length > max ? `\n… cut at ${max} characters (raise max_chars)` : '');
+      } else if (r.bodyNote) {
+        out += `\nnote: ${r.bodyNote}`;
+      }
+      return text(out);
+    }
+    case 'network_route':
+      if (r.routes) return text(r.routes.length ? r.routes.map((x) => `route ${x.id}: ${x.action}${x.action === 'mock' ? ' ' + x.status : ''} ${JSON.stringify(x.pattern)} (${x.hits} hit(s))`).join('\n') : 'no routes in this tab');
+      return text(r.done);
+    case 'network_conditions':
+      return text(r.done);
+    case 'console_messages': {
+      const lines = r.messages.map((m) => `[${m.level}] ${m.text}${m.where ? '  (' + m.where + ')' : ''}`);
+      return text((lines.length ? `${r.messages.length} of ${r.total} message(s)\n` + lines.join('\n') : 'no console messages') + (r.note ? '\nnote: ' + r.note : ''));
     }
     case 'handoff': {
       const secs = Math.round((r.ms || 0) / 1000);

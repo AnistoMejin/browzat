@@ -149,6 +149,18 @@ async function saveAgentTabs() {
   if (sessionStore && agentTabs) { try { await sessionStore.set({ agentTabs: Array.from(agentTabs) }); } catch (e) {} }
 }
 
+// A tab the agent is about to open is marked as the agent's the moment the browser creates it, before its first
+// request, so the network log and the dialog guard see the page from the start.
+let pendingNewTabs = 0;
+api.tabs.onCreated.addListener((t) => {
+  if (pendingNewTabs > 0 && agentTabs) {
+    pendingNewTabs--;
+    agentTabs.add(t.id);
+    earlyMarked.add(t.id);
+  }
+});
+const earlyMarked = new Set();
+
 api.tabs.onRemoved.addListener(async (id) => {
   finishHandoff(id, 'closed', true);
   const s = await getAgentTabs();
@@ -275,6 +287,7 @@ async function run(tabId, func, args, opts) {
   if (opts.allFrames) inj.target.allFrames = true;
   else inj.target.frameIds = [opts.frameId || 0];
   if (opts.world) inj.world = opts.world;
+  if (opts.immediate) inj.injectImmediately = true;
   try {
     return await api.scripting.executeScript(inj);
   } catch (e) {
@@ -377,7 +390,28 @@ async function cdpAttach(tabId) {
     try { await api.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true }); } catch (e) {}
   }
   clearTimeout(s.timer);
-  s.timer = setTimeout(() => cdpDetach(tabId), CDP_IDLE_MS);
+  // Pinned (routes, network conditions or body capture active): stay attached until unpinned.
+  const pins = cdpPins.get(tabId);
+  if (!pins || !pins.size) s.timer = setTimeout(() => cdpDetach(tabId), CDP_IDLE_MS);
+}
+
+const cdpPins = new Map(); // tabId -> Set of reasons ('routes', 'conditions', 'bodies')
+
+async function cdpPin(tabId, reason) {
+  if (!cdpPins.has(tabId)) cdpPins.set(tabId, new Set());
+  cdpPins.get(tabId).add(reason);
+  await cdpAttach(tabId);
+}
+
+function cdpUnpin(tabId, reason) {
+  const pins = cdpPins.get(tabId);
+  if (!pins) return;
+  pins.delete(reason);
+  if (!pins.size) {
+    cdpPins.delete(tabId);
+    const s = cdpTabs.get(tabId);
+    if (s) { clearTimeout(s.timer); s.timer = setTimeout(() => cdpDetach(tabId), CDP_IDLE_MS); }
+  }
 }
 
 async function cdpDetach(tabId) {
@@ -402,9 +436,20 @@ function cdpEvent(tabId, method, ms) {
 }
 
 if (HAS_CDP) {
-  api.debugger.onDetach.addListener((src) => {
+  api.debugger.onDetach.addListener((src, reason) => {
     const s = cdpTabs.get(src.tabId);
     if (s) { clearTimeout(s.timer); cdpTabs.delete(src.tabId); }
+    // The user closed the debugging bar (or the tab went away): everything that needed the debugger is off now.
+    if (cdpPins.has(src.tabId)) {
+      cdpPins.delete(src.tabId);
+      const n = netTab(src.tabId, false);
+      if (n) {
+        n.routes = [];
+        n.conditions = null;
+        n.bodies = false;
+        n.notice = 'the debugger was detached (' + reason + '): routes, network conditions and body capture were switched off';
+      }
+    }
   });
   api.debugger.onEvent.addListener((src, method, params) => {
     for (const w of cdpWaiters) {
@@ -533,6 +578,316 @@ async function realAct(tabId, p, action) {
   return null;
 }
 
+// ---- network and console ----
+// Requests are recorded only for tabs the agent opened, and for tabs it asked to watch (by calling network_requests
+// on them). The log lives in memory, at most NET_MAX requests per tab, and is dropped when the tab closes.
+
+const NET_MAX = 500;
+const BODY_MAX = 1024 * 1024;
+const STATIC_TYPES = new Set(['image', 'imageset', 'font', 'stylesheet', 'media', 'object', 'ping', 'csp_report', 'beacon']);
+const nets = new Map();
+
+function netTab(tabId, create) {
+  let n = nets.get(tabId);
+  if (!n && create) {
+    n = { seq: 0, list: [], byReq: new Map(), routes: [], routeSeq: 0, conditions: null, bodies: false, cdpBodies: [], cdpReqs: new Map(), watch: false, notice: '', consoleSince: 0 };
+    nets.set(tabId, n);
+  }
+  return n || null;
+}
+
+function netWatched(tabId) {
+  if (tabId == null || tabId < 0) return false;
+  const n = nets.get(tabId);
+  return !!((agentTabs && agentTabs.has(tabId)) || (n && n.watch));
+}
+
+function bytesOf(parts) {
+  let total = 0;
+  for (const p of parts) total += p.byteLength;
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(new Uint8Array(p), o); o += p.byteLength; }
+  return out;
+}
+
+function b64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+function utf8(bytes) {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch (e) { return null; }
+}
+
+function reqBodyText(rb) {
+  if (!rb) return '';
+  if (rb.error) return '[' + rb.error + ']';
+  if (rb.formData) {
+    // The browser hands form posts over as parsed fields, not as the bytes sent: the field order may differ.
+    return Object.entries(rb.formData).map(([k, v]) => v.map((x) => encodeURIComponent(k) + '=' + encodeURIComponent(x)).join('&')).join('&') +
+      '\n(parsed form fields; their order may differ from the request. For the exact body, record bodies with network_requests bodies: true)';
+  }
+  if (rb.raw) {
+    const parts = rb.raw.map((r) => r.bytes || new ArrayBuffer(0));
+    const files = rb.raw.filter((r) => r.file).map((r) => '[file ' + r.file + ']');
+    const bytes = bytesOf(parts);
+    const t = utf8(bytes.subarray(0, 65536));
+    return (t != null ? t : '[' + bytes.length + ' bytes of binary data]') + (files.length ? ' ' + files.join(' ') : '') + (bytes.length > 65536 ? ' …(cut at 64 KB)' : '');
+  }
+  return '';
+}
+
+function patternRe(p) {
+  const s = String(p || '');
+  // /regex/flags only when the flags are real regex flags; "/api/data" is a path, not /api/ with flags "data".
+  const m = /^\/(.+)\/([dgimsuy]*)$/.exec(s);
+  if (m) { try { return new RegExp(m[1], m[2]); } catch (e) {} }
+  const esc = (x) => x.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  if (s.includes('*')) return new RegExp('^' + s.split('*').map(esc).join('.*') + '$');
+  return new RegExp(esc(s));
+}
+
+function matchRoute(n, url) {
+  if (!n || !n.routes.length) return null;
+  return n.routes.find((r) => r.re.test(url)) || null;
+}
+
+function addEntry(n, d) {
+  const e = { n: ++n.seq, reqId: d.requestId, method: d.method, url: d.url, type: d.type, start: d.timeStamp };
+  n.list.push(e);
+  n.byReq.set(d.requestId, e);
+  if (n.list.length > NET_MAX) {
+    const old = n.list.shift();
+    if (n.byReq.get(old.reqId) === old) n.byReq.delete(old.reqId);
+  }
+  return e;
+}
+
+const WR = api.webRequest;
+if (WR) {
+  const filter = { urls: ['<all_urls>'] };
+  const spec = (base) => (IS_FIREFOX ? base : base.filter((x) => x !== 'blocking').concat(base.some((x) => /Headers$/.test(x)) ? ['extraHeaders'] : []));
+  const entryOf = (d) => {
+    const n = netWatched(d.tabId) ? netTab(d.tabId, true) : null;
+    return n ? [n, n.byReq.get(d.requestId)] : [null, null];
+  };
+
+  WR.onBeforeRequest.addListener((d) => {
+    if (!netWatched(d.tabId)) return undefined;
+    const n = netTab(d.tabId, true);
+    let e = n.byReq.get(d.requestId);
+    if (!e || e.redirect) e = addEntry(n, d);
+    if (d.requestBody) e.reqBody = reqBodyText(d.requestBody);
+    if (!IS_FIREFOX) return undefined;
+    // Firefox: routes and response bodies are handled here (Chrome and Edge use the debugger for both).
+    const route = matchRoute(n, d.url);
+    if (route) {
+      route.hits++;
+      e.route = route.action;
+      if (route.action === 'block') { e.error = 'blocked by route ' + route.id; return { cancel: true }; }
+      e.mock = route;
+      try {
+        const f = WR.filterResponseData(d.requestId);
+        f.onstart = () => { f.write(new TextEncoder().encode(route.body || '')); f.close(); };
+        f.onerror = () => {};
+      } catch (err) {}
+      return undefined;
+    }
+    if (n.bodies) {
+      try {
+        const f = WR.filterResponseData(d.requestId);
+        const parts = [];
+        let size = 0;
+        f.ondata = (ev) => { size += ev.data.byteLength; if (size <= BODY_MAX) parts.push(ev.data); f.write(ev.data); };
+        f.onstop = () => { f.close(); e.body = { bytes: bytesOf(parts), size, truncated: size > BODY_MAX }; };
+        f.onerror = () => {};
+      } catch (err) {}
+    }
+    return undefined;
+  }, filter, spec(['blocking', 'requestBody']));
+
+  WR.onSendHeaders.addListener((d) => {
+    const [, e] = entryOf(d);
+    if (e) e.reqHeaders = d.requestHeaders || [];
+  }, filter, spec(['requestHeaders']));
+
+  WR.onHeadersReceived.addListener((d) => {
+    const [, e] = entryOf(d);
+    if (!e) return undefined;
+    e.status = d.statusCode;
+    e.statusLine = d.statusLine || '';
+    e.resHeaders = d.responseHeaders || [];
+    if (IS_FIREFOX && e.mock) {
+      // The mocked body replaces the server's: drop length and encoding, set the type and any extra headers.
+      const r = e.mock;
+      const drop = new Set(['content-length', 'content-encoding', 'content-type']);
+      for (const h of Object.keys(r.headers || {})) drop.add(h.toLowerCase());
+      const headers = (d.responseHeaders || []).filter((h) => !drop.has(h.name.toLowerCase()));
+      headers.push({ name: 'Content-Type', value: r.contentType || 'text/plain' });
+      for (const [k, v] of Object.entries(r.headers || {})) headers.push({ name: k, value: String(v) });
+      e.resHeaders = headers;
+      return { responseHeaders: headers };
+    }
+    return undefined;
+  }, filter, spec(['blocking', 'responseHeaders']));
+
+  WR.onBeforeRedirect.addListener((d) => {
+    const [, e] = entryOf(d);
+    if (e) { e.status = d.statusCode; e.redirect = d.redirectUrl; e.end = d.timeStamp; }
+  }, filter);
+  WR.onCompleted.addListener((d) => {
+    const [, e] = entryOf(d);
+    if (e) { e.status = d.statusCode; e.end = d.timeStamp; e.fromCache = !!d.fromCache; e.ip = d.ip || ''; }
+  }, filter);
+  WR.onErrorOccurred.addListener((d) => {
+    const [, e] = entryOf(d);
+    if (e) { e.error = e.error || d.error; e.end = d.timeStamp; }
+  }, filter);
+}
+
+api.tabs.onRemoved.addListener((id) => { nets.delete(id); });
+
+// Chrome and Edge: response bodies, routes and network conditions go through the debugger.
+async function netNetworkDomain(tabId) {
+  const n = netTab(tabId, true);
+  if (n.bodies || n.conditions) await cdp(tabId, 'Network.enable', { maxTotalBufferSize: 20 * BODY_MAX, maxResourceBufferSize: BODY_MAX });
+  else { try { await cdp(tabId, 'Network.disable'); } catch (e) {} }
+}
+
+async function netApplyRoutes(tabId) {
+  const n = netTab(tabId, true);
+  if (n.routes.length) {
+    await cdpPin(tabId, 'routes');
+    await cdp(tabId, 'Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+  } else {
+    try { await cdp(tabId, 'Fetch.disable'); } catch (e) {}
+    cdpUnpin(tabId, 'routes');
+  }
+}
+
+async function netCdpEvent(tabId, method, p) {
+  const n = nets.get(tabId);
+  if (!n) return;
+  if (method === 'Fetch.requestPaused') {
+    const route = matchRoute(n, p.request.url);
+    const send = (m, params) => api.debugger.sendCommand({ tabId }, m, Object.assign({ requestId: p.requestId }, params)).catch(() => {});
+    if (!route) return send('Fetch.continueRequest', {});
+    route.hits++;
+    if (route.action === 'block') return send('Fetch.failRequest', { errorReason: 'BlockedByClient' });
+    const headers = [{ name: 'Content-Type', value: route.contentType || 'text/plain' }];
+    for (const [k, v] of Object.entries(route.headers || {})) headers.push({ name: k, value: String(v) });
+    return send('Fetch.fulfillRequest', { responseCode: route.status || 200, responseHeaders: headers, body: b64(new TextEncoder().encode(route.body || '')) });
+  }
+  if (!n.bodies) return;
+  if (method === 'Network.requestWillBeSent') {
+    const r = { method: p.request.method, url: p.request.url, ts: (p.wallTime || Date.now() / 1000) * 1000, postData: p.request.postData || '' };
+    n.cdpReqs.set(p.requestId, r);
+    if (p.request.hasPostData && !r.postData) {
+      api.debugger.sendCommand({ tabId }, 'Network.getRequestPostData', { requestId: p.requestId }).then((x) => { r.postData = (x && x.postData) || ''; }).catch(() => {});
+    }
+  } else if (method === 'Network.responseReceived') {
+    const r = n.cdpReqs.get(p.requestId);
+    if (r) r.mime = p.response.mimeType;
+  } else if (method === 'Network.loadingFinished') {
+    const r = n.cdpReqs.get(p.requestId);
+    n.cdpReqs.delete(p.requestId);
+    if (!r || p.encodedDataLength > BODY_MAX * 4) return;
+    try {
+      const body = await api.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId: p.requestId });
+      n.cdpBodies.push(Object.assign(r, { body: body.body, base64: !!body.base64Encoded }));
+      if (n.cdpBodies.length > 200) n.cdpBodies.shift();
+    } catch (e) {}
+  } else if (method === 'Network.loadingFailed') {
+    n.cdpReqs.delete(p.requestId);
+  }
+}
+
+if (HAS_CDP) api.debugger.onEvent.addListener((src, method, params) => { netCdpEvent(src.tabId, method, params || {}); });
+
+function bodyFor(n, e) {
+  if (e.body) {
+    const t = utf8(e.body.bytes);
+    return t != null
+      ? { text: t, size: e.body.size, truncated: e.body.truncated }
+      : { binary: true, size: e.body.size, b64: e.body.size <= 65536 ? b64(e.body.bytes) : '' };
+  }
+  // Chrome and Edge: the debugger's copy of the same request (same method and URL, closest in time).
+  let best = null;
+  for (const c of n.cdpBodies) {
+    if (c.method === e.method && c.url === e.url && (!best || Math.abs(c.ts - e.start) < Math.abs(best.ts - e.start))) best = c;
+  }
+  if (!best || Math.abs(best.ts - e.start) > 60000) return null;
+  if (!best.base64) return { text: best.body, size: best.body.length, mime: best.mime, postData: best.postData };
+  const bin = atob(best.body);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const t = /^(text\/|application\/(json|javascript|xml|x-www-form-urlencoded))|\+json|\+xml/.test(best.mime || '') ? utf8(bytes) : null;
+  return t != null ? { text: t, size: bytes.length, mime: best.mime, postData: best.postData } : { binary: true, size: bytes.length, mime: best.mime, b64: bytes.length <= 65536 ? best.body : '', postData: best.postData };
+}
+
+// Console on Chrome and Edge: enabling the Runtime and Log domains replays the page's stored console messages and
+// errors (up to about 1000), including those from before browzat looked.
+async function cdpConsole(tabId) {
+  const out = [];
+  const val = (o) => {
+    if (!o) return '';
+    if (o.type === 'string') return o.value;
+    if (o.value !== undefined) { try { return JSON.stringify(o.value); } catch (e) { return String(o.value); } }
+    if (o.unserializableValue) return o.unserializableValue;
+    if (o.preview && o.preview.properties) {
+      const props = o.preview.properties.map((p) => p.name + ': ' + (p.type === 'string' ? JSON.stringify(p.value) : p.value)).join(', ');
+      return o.subtype === 'array' ? '[' + o.preview.properties.map((p) => p.value).join(', ') + ']' : '{' + props + (o.preview.overflow ? ', …' : '') + '}';
+    }
+    return o.description || o.type;
+  };
+  const where = (st) => {
+    const f = st && st.callFrames && st.callFrames[0];
+    return f ? f.url + ':' + (f.lineNumber + 1) : '';
+  };
+  const onEv = (src, method, p) => {
+    if (src.tabId !== tabId || !p) return;
+    if (method === 'Runtime.consoleAPICalled') {
+      const level = p.type === 'warning' ? 'warn' : p.type === 'assert' ? 'error' : p.type;
+      out.push({ level, text: (p.args || []).map(val).join(' ').slice(0, 2000), ts: p.timestamp, where: where(p.stackTrace) });
+    } else if (method === 'Runtime.exceptionThrown') {
+      const d = p.exceptionDetails || {};
+      out.push({ level: 'error', text: 'Uncaught ' + ((d.exception && d.exception.description) || d.text || 'exception').split('\n')[0], ts: p.timestamp, where: d.url ? d.url + ':' + (d.lineNumber + 1) : '' });
+    } else if (method === 'Log.entryAdded') {
+      const e = p.entry || {};
+      out.push({ level: e.level === 'warning' ? 'warn' : e.level === 'verbose' ? 'debug' : e.level, text: e.text, ts: e.timestamp, where: e.url ? e.url + (e.lineNumber != null ? ':' + (e.lineNumber + 1) : '') : '', source: e.source });
+    }
+  };
+  api.debugger.onEvent.addListener(onEv);
+  try {
+    await cdp(tabId, 'Runtime.enable');
+    await cdp(tabId, 'Log.enable');
+    await sleep(400);
+  } finally {
+    api.debugger.onEvent.removeListener(onEv);
+    try { await cdp(tabId, 'Log.disable'); } catch (e) {}
+    try { await cdp(tabId, 'Runtime.disable'); } catch (e) {}
+  }
+  const seen = new Set();
+  return out.filter((m) => {
+    const k = m.level + '|' + m.text + '|' + m.ts;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  }).sort((a, b) => a.ts - b.ts);
+}
+
+// Install the dialog guard (and on Firefox the console hook) as each new page starts, in tabs the agent works in.
+if (api.webNavigation) {
+  api.webNavigation.onCommitted.addListener((d) => {
+    if (d.frameId !== 0 || !netWatched(d.tabId)) return;
+    const opts = { frameId: 0, immediate: true };
+    run(d.tabId, bmcpDialogs, [{ op: 'install' }], IS_FIREFOX ? opts : Object.assign({ world: 'MAIN' }, opts)).catch(() => {});
+    if (IS_FIREFOX) run(d.tabId, bmcpConsole, [{ op: 'install' }], opts).catch(() => {});
+  });
+}
+
 // ---- tools ----
 
 const handlers = {
@@ -551,12 +906,18 @@ const handlers = {
       if (p.container) create.cookieStoreId = await containerId(p.container);
       const before = await tabIds();
       let t;
+      pendingNewTabs++;
       try {
         t = await api.tabs.create(create);
       } catch (e) {
-        if (create.cookieStoreId) throw e;
+        if (create.cookieStoreId) { pendingNewTabs = Math.max(0, pendingNewTabs - 1); throw e; }
         const w = await api.windows.create({ url, focused: !!p.active });
         t = w.tabs[0];
+      } finally {
+        // If a different tab was created at the same moment and got marked by mistake, unmark it.
+        for (const x of earlyMarked) if (x !== t?.id) agent.delete(x);
+        earlyMarked.clear();
+        pendingNewTabs = 0;
       }
       agent.add(t.id);
       await saveAgentTabs();
@@ -905,6 +1266,142 @@ handlers.dialog = async (p) => {
   };
 };
 
+async function isAgentTab(id) {
+  return (await getAgentTabs()).has(id);
+}
+
+handlers.network_requests = async (p) => {
+  const id = need(p);
+  await api.tabs.get(id); // fails clearly if the tab is gone
+  const n = netTab(id, true);
+  const startedNow = !n.watch && !(await isAgentTab(id));
+  if (startedNow) n.watch = true;
+  const notes = [];
+  if (n.notice) { notes.push(n.notice); n.notice = ''; }
+  if (p.bodies === true && !n.bodies) {
+    n.bodies = true;
+    if (HAS_CDP) { await cdpPin(id, 'bodies'); await netNetworkDomain(id); }
+    notes.push('response bodies are now recorded for new requests in this tab' + (HAS_CDP ? ' (the debugging bar stays until bodies: false)' : ''));
+  } else if (p.bodies === false && n.bodies) {
+    n.bodies = false;
+    if (HAS_CDP) { await netNetworkDomain(id); cdpUnpin(id, 'bodies'); }
+    notes.push('response bodies are no longer recorded');
+  }
+  if (p.clear) { n.list = []; n.byReq.clear(); n.cdpBodies = []; }
+  if (startedNow) notes.push('this is not a tab you opened: recording starts now, earlier requests are not available; reload the page to see them');
+  let list = n.list.slice();
+  if (!p.include_static) list = list.filter((e) => !STATIC_TYPES.has(e.type));
+  if (p.type) { const want = new Set(String(p.type).split(',').map((s) => s.trim())); list = list.filter((e) => want.has(e.type)); }
+  if (p.filter) { const re = patternRe(p.filter); list = list.filter((e) => re.test(e.url)); }
+  if (p.failed) list = list.filter((e) => e.error || (e.status >= 400));
+  const total = list.length;
+  const limit = clamp(p.limit || 50, 1, NET_MAX);
+  list = list.slice(-limit);
+  return {
+    requests: list.map((e) => ({
+      n: e.n, method: e.method, url: e.url, type: e.type, status: e.status || 0, error: e.error || '',
+      ms: e.end ? Math.round(e.end - e.start) : null, cache: !!e.fromCache, route: e.route || '', redirect: e.redirect || '',
+    })),
+    total, shown: list.length, bodies: n.bodies, routes: n.routes.length, notes,
+  };
+};
+
+handlers.network_request = async (p) => {
+  const id = need(p);
+  const n = netTab(id, false);
+  const e = n && n.list.find((x) => x.n === Number(p.request));
+  if (!e) throw new Error('no request ' + p.request + ' in this tab; list them with network_requests');
+  const out = {
+    n: e.n, method: e.method, url: e.url, type: e.type, status: e.status || 0, statusLine: e.statusLine || '', error: e.error || '',
+    ms: e.end ? Math.round(e.end - e.start) : null, cache: !!e.fromCache, ip: e.ip || '', redirect: e.redirect || '', route: e.route || '',
+    reqHeaders: (e.reqHeaders || []).map((h) => [h.name, h.value]),
+    resHeaders: (e.resHeaders || []).map((h) => [h.name, h.value]),
+    reqBody: e.reqBody || '',
+  };
+  const body = bodyFor(n, e);
+  if (body && body.postData) out.reqBody = body.postData; // the exact bytes, from the debugger
+  if (body) { delete body.postData; out.body = body; }
+  else out.bodyNote = n.bodies ? 'no response body was captured for this request (it may have had none, been cached, or been too large)' :
+    'response bodies are not being recorded: call network_requests with bodies: true, then repeat the request';
+  return out;
+};
+
+handlers.network_route = async (p) => {
+  const id = need(p);
+  const n = netTab(id, true);
+  const action = p.action || 'add';
+  if (action === 'list') {
+    return { routes: n.routes.map((r) => ({ id: r.id, pattern: r.pattern, action: r.action, status: r.status, hits: r.hits })) };
+  }
+  if (action === 'clear' || action === 'remove') {
+    const before = n.routes.length;
+    n.routes = action === 'clear' ? [] : n.routes.filter((r) => r.id !== Number(p.id) && r.pattern !== p.pattern);
+    if (HAS_CDP) await netApplyRoutes(id);
+    return { done: 'removed ' + (before - n.routes.length) + ' route(s); ' + n.routes.length + ' left' };
+  }
+  if (action !== 'add') throw new Error('action must be add, remove, list or clear');
+  if (!p.pattern) throw new Error('pattern is required (a substring, a glob with *, or /regex/)');
+  const r = {
+    id: ++n.routeSeq, pattern: String(p.pattern), re: patternRe(p.pattern), action: p.block ? 'block' : 'mock',
+    status: p.block ? 0 : clamp(p.status || 200, 100, 599), body: p.body == null ? '' : String(p.body),
+    contentType: p.content_type || (p.body && /^\s*[{[]/.test(String(p.body)) ? 'application/json' : 'text/plain'),
+    headers: p.headers && typeof p.headers === 'object' ? p.headers : {}, hits: 0,
+  };
+  n.routes.push(r);
+  if (!(await isAgentTab(id))) n.watch = true;
+  if (HAS_CDP) await netApplyRoutes(id);
+  const note = !HAS_CDP && r.action === 'mock' && r.status !== 200
+    ? ' (Firefox cannot change the status code: the server\'s status is kept, the body and headers are replaced)' : '';
+  return { done: 'route ' + r.id + ': ' + (r.action === 'block' ? 'blocking' : 'mocking with status ' + r.status) + ' requests matching ' + JSON.stringify(r.pattern) + note + (HAS_CDP ? '; the debugging bar stays while routes exist' : '') };
+};
+
+handlers.network_conditions = async (p) => {
+  const id = need(p);
+  if (!HAS_CDP) throw new Error('network conditions (offline, slow network) are not available in Firefox: it has no API for them');
+  const n = netTab(id, true);
+  if (p.reset) {
+    n.conditions = null;
+    try { await cdp(id, 'Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }); } catch (e) {}
+    await netNetworkDomain(id);
+    cdpUnpin(id, 'conditions');
+    return { done: 'network conditions reset to normal' };
+  }
+  const kbps = (v) => (v == null ? -1 : Math.max(1, Number(v)) * 1024 / 8);
+  n.conditions = { offline: !!p.offline, latency: clamp(p.latency_ms || 0, 0, 60000), download: kbps(p.download_kbps), upload: kbps(p.upload_kbps) };
+  await cdpPin(id, 'conditions');
+  await netNetworkDomain(id);
+  await cdp(id, 'Network.emulateNetworkConditions', { offline: n.conditions.offline, latency: n.conditions.latency, downloadThroughput: n.conditions.download, uploadThroughput: n.conditions.upload });
+  return { done: n.conditions.offline ? 'this tab is now offline' : 'network conditions set: ' + n.conditions.latency + ' ms latency' +
+    (p.download_kbps ? ', ' + p.download_kbps + ' kbit/s down' : '') + (p.upload_kbps ? ', ' + p.upload_kbps + ' kbit/s up' : '') + ' (reset with reset: true; the debugging bar stays until then)' };
+};
+
+handlers.console_messages = async (p) => {
+  const id = need(p);
+  const n = netTab(id, true);
+  let entries;
+  let note = '';
+  if (HAS_CDP) {
+    entries = await cdpConsole(id);
+  } else {
+    const r = unwrap((await run(id, bmcpConsole, [{ op: 'take' }], { frameId: 0 }))[0]);
+    entries = r.entries;
+    if (!(await isAgentTab(id)) && !n.watch) {
+      n.watch = true;
+      note = 'console capture in this tab starts now (Firefox records messages only from when browzat starts watching); reload the page to capture its start-up messages';
+    }
+  }
+  entries = entries.filter((m) => m.ts > n.consoleSince);
+  if (p.clear) n.consoleSince = Date.now();
+  const lv = p.level || 'all';
+  const rank = { error: 3, warn: 2, info: 1, log: 1, debug: 0 };
+  if (lv === 'error') entries = entries.filter((m) => m.level === 'error');
+  else if (lv === 'warn') entries = entries.filter((m) => (rank[m.level] || 0) >= 2);
+  else if (lv !== 'all' && lv !== 'debug') entries = entries.filter((m) => (rank[m.level] || 0) >= 1);
+  const total = entries.length;
+  const limit = clamp(p.limit || 100, 1, 1000);
+  return { messages: entries.slice(-limit), total, note };
+};
+
 handlers.handoff = async (p) => {
   const id = need(p);
   const message = String(p.message || '').trim().slice(0, 600) || 'Please finish this step in the page, then click Continue.';
@@ -1000,6 +1497,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     reconnect().then(() => sendResponse({ ok: true }));
     return true;
   }
+  if (msg.type === 'bmcp-watched') {
+    // From early.js (Firefox): keep the console hook only in tabs the agent works in.
+    sendResponse({ watched: !!(sender.tab && netWatched(sender.tab.id)) });
+    return undefined;
+  }
   if (msg.type === 'bmcp-handoffs') {
     // For the popup: the open handoffs, with the tab title to recognise them.
     Promise.all([...handoffs.entries()].map(async ([tabId, h]) => {
@@ -1034,5 +1536,6 @@ api.alarms.onAlarm.addListener((a) => { if (a.name === 'bmcp-reconnect') connect
 api.runtime.onInstalled.addListener(() => { ensureAlarm(); connect(); scanForPairingTab(); });
 api.runtime.onStartup.addListener(() => { ensureAlarm(); connect(); });
 ensureAlarm();
+getAgentTabs(); // loads the agent's tabs early, so the network log knows which tabs to record
 connect();
 scanForPairingTab();

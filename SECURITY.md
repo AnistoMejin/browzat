@@ -30,6 +30,15 @@ only to the tab the agent is acting in, only for the duration of the action plus
 "started debugging this browser" bar whenever it is attached. `upload` can read any local file the agent names; the
 agent decides which files go to which site, so connect only agents you trust.
 
+Since 0.5.0 the extension also uses `webRequest` and `webNavigation` (Firefox: plus `webRequestBlocking`) to record
+requests, and a content script that starts in every Firefox page. What is recorded:
+
+- Only in tabs the agent opened, or a tab the agent was told to watch. Your other tabs are not recorded. The Firefox
+  content script removes itself from those tabs as soon as it learns they are not the agent's, and puts the page's
+  console back as it was.
+- Request and response headers include cookies and authorization headers, and request bodies can include form data.
+  This stays in the extension's memory, is shown only to the agent that asks, and is dropped when the tab closes.
+
 ## What it does not protect against
 
 - Other software running under your user account can read the token file and drive your browsers.
