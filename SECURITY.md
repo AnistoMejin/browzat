@@ -39,6 +39,22 @@ requests, and a content script that starts in every Firefox page. What is record
 - Request and response headers include cookies and authorization headers, and request bodies can include form data.
   This stays in the extension's memory, is shown only to the agent that asks, and is dropped when the tab closes.
 
+Since 0.6.0 the extension uses the `cookies` permission to read and change cookies for the site selected by a tab.
+Cookie and Web Storage values can be login secrets. They are returned only to the requesting agent and are never
+written to the relay log. `storage_state` files contain those secrets in plain text, are created with private file
+permissions under `~/.browser-mcp/output`, and should be deleted when they are no longer needed. Clear and restore
+operations are deliberately limited to one site so they cannot wipe every login in a real browser profile.
+
+Since 0.7.0 Chrome and Edge can keep the debugger attached while `emulate` settings are active. Reset emulation when
+the task is done. Per-tab header overrides can add or remove request headers, so they may change authentication and
+site behaviour. Screenshot and PDF paths accept only their image or PDF extensions, never overwrite an existing file,
+and create files with private permissions.
+
+Performance traces can contain page URLs, script names and timing data. Visual recordings contain screenshots. Both
+are written under the private output folder and should be deleted when no longer needed. Audits run entirely in the
+tab and return findings only. Chromium logpoints evaluate a console expression at a chosen source location and keep
+the debugger attached until they are cleared.
+
 ## What it does not protect against
 
 - Other software running under your user account can read the token file and drive your browsers.

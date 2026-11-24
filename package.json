@@ -1,7 +1,6 @@
 {
-  "name": "browser-mcp",
-  "version": "0.5.0",
-  "private": true,
+  "name": "browzat",
+  "version": "0.10.0",
   "description": "browzat: local MCP server and browser extension that drive the user's own logged-in Chrome, Edge and Firefox profiles.",
   "keywords": [
     "mcp",
@@ -26,6 +25,23 @@
   "engines": {
     "node": ">=20"
   },
+  "bin": {
+    "browzat": "bin/browzat.js"
+  },
+  "files": [
+    "bin/",
+    "server/",
+    "extension/",
+    "assets/",
+    "docs/distribution.md",
+    "docs/privacy-policy.md",
+    "install.ps1",
+    "install.sh",
+    "README.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "node extension/build.js",
     "check": "node test/check.js",
@@ -34,7 +50,9 @@
     "status": "node server/cli.js status",
     "pair": "node server/cli.js pair",
     "reload": "node server/cli.js reload all",
-    "stop": "node server/cli.js stop"
+    "stop": "node server/cli.js stop",
+    "release": "node scripts/release.js",
+    "prepack": "npm run check"
   },
   "dependencies": {
     "ws": "^8.18.0"

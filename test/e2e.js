@@ -1,17 +1,69 @@
 'use strict';
 // End-to-end test through the real MCP server:  node test/e2e.js <browser-id>
 // The browser must be running with the extension installed and paired.
+//
+// The checks in this file are the group "core". A feature adds its own checks as a section file,
+// test/e2e/<nn>-<group>.js, that exports async (t) => { ... }. Sections run in file-name order after the built-in
+// checks and before the final tab-list and close checks. E2E_ONLY=<group,...> runs only the named groups.
+// What a section gets in t is listed in test/e2e/README.md. node test/bed.js runs all of this on throwaway browsers.
 const { spawn } = require('child_process');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 const browser = process.argv[2];
 if (!browser) { console.error('usage: node test/e2e.js <browser-id>'); process.exit(2); }
 
-const PAGE_PORT = 19791;
-const base = `http://127.0.0.1:${PAGE_PORT}`;
-const FORM = `<!doctype html><html><head><meta charset="utf-8"><title>BMCP test</title></head><body>
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const isFirefox = browser === 'firefox' || /^firefox/.test(browser);
+
+// ---- sections: test/e2e/<nn>-<group>.js ----
+
+const SECTION_DIR = path.join(__dirname, 'e2e');
+
+// Returns [{ file, group, fn }] in file-name order. Throws on a misnamed file, a duplicate group or a bad export.
+function loadSections() {
+  let names = [];
+  try { names = fs.readdirSync(SECTION_DIR); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const out = [];
+  for (const f of names.filter((n) => n.endsWith('.js') && !n.startsWith('_')).sort()) {
+    const m = /^(\d+)-([a-z0-9][a-z0-9-]*)\.js$/.exec(f);
+    if (!m) throw new Error(`test/e2e/${f}: name it <nn>-<group>.js, for example 30-storage.js (helper files start with _)`);
+    const group = m[2];
+    if (group === 'core') throw new Error(`test/e2e/${f}: "core" is the name of the built-in checks`);
+    const twin = out.find((s) => s.group === group);
+    if (twin) throw new Error(`test/e2e/${f}: the group "${group}" is already used by ${twin.file}`);
+    const fn = require(path.join(SECTION_DIR, f));
+    if (typeof fn !== 'function') throw new Error(`test/e2e/${f}: must export async (t) => { ... }`);
+    out.push({ file: 'test/e2e/' + f, group, fn });
+  }
+  return out;
+}
+
+let sections = [];
+let only = null;
+try {
+  sections = loadSections();
+  const want = String(process.env.E2E_ONLY || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (want.length) {
+    const known = ['core', ...sections.map((s) => s.group)];
+    const unknown = want.filter((w) => !known.includes(w));
+    if (unknown.length) throw new Error(`E2E_ONLY names no group "${unknown[0]}"; the groups are: ${known.join(', ')}`);
+    only = new Set(want);
+  }
+} catch (e) {
+  console.error('error: ' + e.message);
+  process.exit(2);
+}
+const runCore = !only || only.has('core');
+if (only) sections = sections.filter((s) => only.has(s.group));
+
+// ---- the local test server ----
+
+let base = ''; // http://127.0.0.1:<port>, set when the server below listens on a free port
+const routes = []; // pages and APIs added by sections with t.route(): { prefix, handler, group }
+const FORM =`<!doctype html><html><head><meta charset="utf-8"><title>BMCP test</title></head><body>
 <h1>Test form</h1>
 <form id="f">
 <label for="name">Your name</label> <input id="name">
@@ -69,7 +121,24 @@ Promise.reject(new Error('nobody-caught-me'));
 setTimeout(() => { throw new Error('boom-uncaught'); }, 50);
 </script></body></html>`;
 
+function serveRoute(route, req, res) {
+  const h = route.handler;
+  try {
+    if (typeof h === 'function') return h(req, res, new URL(req.url, base));
+    const o = typeof h === 'string' || Buffer.isBuffer(h) ? { body: h } : h;
+    const headers = Object.assign({}, o.headers);
+    if (!Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) headers['content-type'] = 'text/html; charset=utf-8';
+    res.writeHead(o.status || 200, headers);
+    return res.end(o.body == null ? '' : o.body);
+  } catch (e) {
+    try { res.writeHead(500, { 'content-type': 'text/plain' }); } catch (e2) {}
+    return res.end('route ' + route.prefix + ' failed: ' + ((e && e.stack) || e));
+  }
+}
+
 const pages = http.createServer((req, res) => {
+  const route = routes.find((x) => req.url.startsWith(x.prefix));
+  if (route) return serveRoute(route, req, res);
   if (req.url.startsWith('/api/data')) {
     res.writeHead(200, { 'content-type': 'application/json', 'x-test': 'browzat' });
     return res.end('{"answer":42}');
@@ -88,10 +157,13 @@ const pages = http.createServer((req, res) => {
   res.end(req.url.startsWith('/second') ? SECOND : req.url.startsWith('/console') ? CONSOLE_PAGE : FORM);
 });
 
-const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'mcp.js')], { stdio: ['pipe', 'pipe', 'inherit'] });
+// Extra command-line arguments are handed on to the MCP server, which ignores them (test/bed.js tags its processes so).
+const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'mcp.js'), ...process.argv.slice(3)], { stdio: ['pipe', 'pipe', 'inherit'] });
 let buf = '';
 let nextId = 1;
 const pending = new Map();
+const waiting = new Map(); // id -> reject, to fail at once when the MCP server goes away
+let mcpGone = '';
 mcp.stdout.on('data', (d) => {
   buf += d.toString();
   let i;
@@ -103,12 +175,21 @@ mcp.stdout.on('data', (d) => {
     if (pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
   }
 });
+mcp.on('exit', (code) => {
+  mcpGone = `the MCP server exited (code ${code})` + (code ? '; see its message above' : '');
+  for (const reject of waiting.values()) reject(new Error(mcpGone));
+  waiting.clear();
+  pending.clear();
+});
+mcp.stdin.on('error', () => {});
 
 function request(method, params) {
   const id = nextId++;
   return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('timeout: ' + method)), 120000);
-    pending.set(id, (m) => { clearTimeout(t); resolve(m); });
+    if (mcpGone) return reject(new Error(mcpGone));
+    const t = setTimeout(() => { waiting.delete(id); reject(new Error('timeout: ' + method)); }, 120000);
+    waiting.set(id, (e) => { clearTimeout(t); reject(e); });
+    pending.set(id, (m) => { clearTimeout(t); waiting.delete(id); resolve(m); });
     mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   });
 }
@@ -125,20 +206,121 @@ async function call(name, args) {
 }
 
 let failed = 0;
+let total = 0;
 function check(name, ok, detail) {
+  total++;
   if (!ok) failed++;
   console.log((ok ? 'PASS  ' : 'FAIL  ') + name + (ok ? '' : '\n      ' + String(detail).replace(/\n/g, '\n      ').slice(0, 1500)));
 }
 const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; };
 
-(async () => {
-  await new Promise((r) => pages.listen(PAGE_PORT, '127.0.0.1', r));
-  let tab = null;
+// The 21 built-in tools, plus the tools that feature modules (server/tools/*.js) add.
+let moduleTools = 0;
+try { moduleTools = require('../server/tool-modules').loadToolModules().reduce((n, m) => n + m.tools.length, 0); } catch (e) {}
+
+// Listens on a free port chosen by the system, so several runs can go on at the same moment.
+async function listenFree(server) {
+  for (;;) {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
+    });
+    const { port } = server.address();
+    if (port !== 19789) return port; // never sit on the relay's default port
+    await new Promise((r) => server.close(r));
+  }
+}
+
+// Calls fn until it returns something truthy or the time is up; returns the last value.
+async function poll(fn, timeoutMs = 5000, everyMs = 200) {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    const v = await fn();
+    if (v || Date.now() >= end) return v;
+    await sleep(everyMs);
+  }
+}
+
+// Runs one section file. A section that throws counts as one failed check; the tabs it opened, its routes and its
+// temporary folder are removed either way.
+async function runSection(s, tools) {
+  const opened = new Set();
+  const own = [];
+  let tmp = '';
+  const t = {
+    group: s.group,
+    browser,
+    firefox: isFirefox,
+    chromium: !isFirefox,
+    real: !!process.env.E2E_REAL,
+    base,
+    tools,
+    refOf,
+    poll,
+    sleep,
+    get tmp() {
+      if (!tmp) tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'browzat-e2e-'));
+      return tmp;
+    },
+    check: (name, ok, detail) => check(s.group + ': ' + name, ok, detail),
+    async call(name, args) {
+      args = args || {};
+      const r = await call(name, args);
+      const got = r.isError ? null : (/^tab: (\S+)/m.exec(r.text) || [])[1];
+      if (name === 'tabs' && args.action === 'close' && !r.isError) opened.delete(String(args.tab));
+      else if (name === 'tabs' && args.action === 'new' && got) opened.add(got);
+      else if (name === 'navigate' && got && got !== args.tab && opened.has(String(args.tab))) opened.add(got); // reopened in a container
+      return r;
+    },
+    async open(where, args) {
+      where = where == null ? '/form' : String(where);
+      const url = /^[a-z][a-z0-9+.-]*:/i.test(where) ? where : base + (where.startsWith('/') ? '' : '/') + where;
+      const r = await t.call('tabs', Object.assign({ action: 'new', browser, url }, args));
+      const tab = r.isError ? null : (/^tab: (\S+)/m.exec(r.text) || [])[1];
+      if (!tab) throw new Error('could not open a tab on ' + url + ': ' + r.text);
+      return tab;
+    },
+    async close(tab) {
+      await t.call('tabs', { action: 'close', tab });
+    },
+    async evaluate(tab, code) {
+      return (await t.call('evaluate', { tab, code })).text.trim();
+    },
+    async snapshot(tab, args) {
+      return (await t.call('snapshot', Object.assign({ tab }, args))).text;
+    },
+    route(prefix, handler) {
+      prefix = String(prefix || '');
+      if (!prefix.startsWith('/') || prefix === '/') throw new Error('route: the path prefix must start with / and name a path, for example /' + s.group + '/page');
+      if (routes.some((x) => x.prefix === prefix)) throw new Error('route: ' + prefix + ' is already taken');
+      const ok = typeof handler === 'function' || typeof handler === 'string' || Buffer.isBuffer(handler) || (handler && typeof handler === 'object');
+      if (!ok) throw new Error('route: the handler must be a function (req, res, url), an HTML string, or { status, headers, body }');
+      const entry = { prefix, handler, group: s.group };
+      own.push(entry);
+      routes.push(entry);
+      routes.sort((a, b) => b.prefix.length - a.prefix.length); // the longest prefix wins
+      return base + prefix;
+    },
+  };
+  console.log(`---- ${s.group} (${s.file})`);
   try {
-    const init = await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
-    mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
-    const tools = await request('tools/list', {});
-    check('MCP handshake and tool list', init.result.serverInfo.name === 'browser-mcp' && tools.result.tools.length === 21, JSON.stringify(init.result));
+    await s.fn(t);
+  } catch (e) {
+    check(s.group + ': the section ran to its end', false, (e && e.stack) || e);
+  } finally {
+    for (const tab of opened) await call('tabs', { action: 'close', tab }).catch(() => {});
+    for (const entry of own) routes.splice(routes.indexOf(entry), 1);
+    if (tmp) { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {} }
+  }
+}
+
+(async () => {
+  base = `http://127.0.0.1:${await listenFree(pages)}`;
+  let tab = null;
+
+  // The built-in checks ("core"), up to the point where the sections run.
+  const coreChecks = async (init, tools) => {
+    check('MCP handshake and tool list', init.result.serverInfo.name === 'browser-mcp' && tools.result.tools.length === 21 + moduleTools, JSON.stringify(init.result));
 
     let r = await call('status', {});
     check(`status lists ${browser}`, new RegExp('^' + browser + '\\b', 'm').test(r.text), r.text);
@@ -271,7 +453,8 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
       const typed2 = (await call('evaluate', { tab: ptab, code: "document.getElementById('name').value" })).text.trim();
       check('type with clear:false appends', typed2 === 'Real typing more', typed2);
 
-      const tmp = path.join(require('os').tmpdir(), 'browzat-e2e-upload.txt');
+      // In a folder of its own: several runs can go on at the same moment.
+      const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'browzat-e2e-')), 'browzat-e2e-upload.txt');
       fs.writeFileSync(tmp, 'hello from browzat\n');
       r = await call('upload', { tab: ptab, selector: '#file', files: [tmp] });
       const up = await read('fileOut');
@@ -279,6 +462,7 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
       r = await call('upload', { tab: ptab, selector: '#file', files: [tmp + '.missing'] });
       check('upload reports a missing file', r.isError && /file not found/.test(r.text), r.text);
       fs.unlinkSync(tmp);
+      fs.rmdirSync(path.dirname(tmp));
 
       r = await call('click', { tab: ptab, selector: '#ask' });
       check('a confirm is dismissed by default and reported', (await read('dlgOut')) === 'confirm=false' && /dialog: confirm "Delete it\?" -> dismissed/.test(r.text), r.text);
@@ -405,8 +589,8 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
       r = await call('tabs', { action: 'new', browser, url: base + '/form' });
       const htab = (/^tab: (\S+)/m.exec(r.text) || [])[1];
       const waiting = call('handoff', { tab: htab, message: 'E2E test: nobody needs to click this.', timeout_s: 10 });
-      await new Promise((res) => setTimeout(res, 2000));
-      check('handoff shows a card in the page', (await cardThere(htab)) === 'true', 'card not found');
+      const cardShown = await poll(async () => (await cardThere(htab)) === 'true' && true, 5000);
+      check('handoff shows a card in the page', cardShown, 'card not found');
       const inner = await call('evaluate', {
         tab: htab,
         code: "const h = [...document.body.children].find((x) => x.style.zIndex === '2147483647'); return h ? String(h.shadowRoot) : 'no host';",
@@ -417,15 +601,20 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
       check('the card is removed after the handoff', (await cardThere(htab)) === 'false', 'card still there');
 
       const closing = call('handoff', { tab: htab, message: 'E2E test: the tab will move, then close.', timeout_s: 60 });
-      await new Promise((res) => setTimeout(res, 1500));
+      await poll(async () => (await cardThere(htab)) === 'true' && true, 5000);
       await call('navigate', { tab: htab, url: base + '/second' });
-      await new Promise((res) => setTimeout(res, 1500));
-      check('the card comes back after the page navigates', (await cardThere(htab)) === 'true', 'card not found on the new page');
+      const cardReturned = await poll(async () => (await cardThere(htab)) === 'true' && true, 5000);
+      check('the card comes back after the page navigates', cardReturned, 'card not found on the new page');
       await call('tabs', { action: 'close', tab: htab });
       r = await closing;
       check('closing the tab ends the handoff', r.isError && /tab was closed/.test(r.text), r.text);
     }
+  };
 
+  // The last built-in checks: the tab list, and closing the first tab. Run these before feature sections because
+  // the comfort section deliberately exercises `tabs cleanup`, which closes every agent-owned tab in the session.
+  const coreLastChecks = async () => {
+    let r;
     r = await call('tabs', { action: 'list', browser });
     check('tabs list shows the tab I opened', r.text.includes(tab) && !r.text.includes('(user tab)'), r.text);
     r = await call('tabs', { action: 'list' });
@@ -440,6 +629,26 @@ const refOf = (snap, re) => { const m = re.exec(snap); return m ? m[1] : null; }
     r = await call('tabs', { action: 'close', tab });
     check('close the tab', /^closed/.test(r.text), r.text);
     tab = null;
+  };
+
+  try {
+    const init = await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
+    mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+    const tools = await request('tools/list', {});
+    if (runCore) {
+      try {
+        await coreChecks(init, tools);
+        await coreLastChecks();
+      } catch (e) {
+        failed++;
+        console.log('FAIL  core checks stopped: ' + e.message);
+      }
+    }
+    for (const s of sections) await runSection(s, tools.result.tools);
+    if (!total && !failed) {
+      failed++;
+      console.log('FAIL  no check ran');
+    }
   } catch (e) {
     failed++;
     console.log('FAIL  test run stopped: ' + e.message);

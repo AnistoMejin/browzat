@@ -151,10 +151,10 @@ async function saveAgentTabs() {
 
 // A tab the agent is about to open is marked as the agent's the moment the browser creates it, before its first
 // request, so the network log and the dialog guard see the page from the start.
-let pendingNewTabs = 0;
+const pendingNewTabs = [];
 api.tabs.onCreated.addListener((t) => {
-  if (pendingNewTabs > 0 && agentTabs) {
-    pendingNewTabs--;
+  if (pendingNewTabs.length && agentTabs) {
+    pendingNewTabs.shift();
     agentTabs.add(t.id);
     earlyMarked.add(t.id);
   }
@@ -225,6 +225,7 @@ function brief(t, agent, extra, cmap) {
   const b = { tabId: t.id, url: t.url || t.pendingUrl || '', title: t.title || '', agent: agent.has(t.id), active: !!t.active };
   const c = cmap && t.cookieStoreId && cmap.get(t.cookieStoreId);
   if (c) b.container = c;
+  if (t.group) b.group = t.group;
   return Object.assign(b, extra);
 }
 
@@ -269,13 +270,13 @@ async function findReplacement(before, goneId, waitMs) {
   }
 }
 
-async function waitForLoad(tabId, timeoutMs, expectLoad) {
+async function waitForLoad(tabId, timeoutMs, expectLoad, graceMs = 1000) {
   const start = Date.now();
   let sawLoading = false;
   for (;;) {
     const tab = await api.tabs.get(tabId);
     if (tab.status === 'loading') sawLoading = true;
-    else if (sawLoading || !expectLoad || Date.now() - start > 1000) return { tab, timedOut: false };
+    else if (sawLoading || !expectLoad || Date.now() - start > graceMs) return { tab, timedOut: false };
     if (Date.now() - start > timeoutMs) return { tab, timedOut: true };
     await sleep(120);
   }
@@ -342,7 +343,10 @@ async function act(p, action) {
     }
   }
   await sleep(350);
-  const after = await waitForLoad(id, clamp(p.timeout_ms || 10000, 500, 60000), false);
+  // Firefox may defer an anchor's synthetic default navigation while its tab is in the background. Give links a
+  // short loading grace period so click can still report the destination instead of returning the old URL.
+  const expectsNavigation = action === 'click' && /^(?:double-)?clicked a(?: |$)/.test(String(done));
+  const after = await waitForLoad(id, clamp(p.timeout_ms || 10000, 500, 60000), expectsNavigation, 2500);
   let dialogs = [];
   try { dialogs = await runDialogs(id, { op: 'take' }); } catch (e) {}
   return { done, note, dialogs, url: after.tab.url, title: after.tab.title, navigated: after.tab.url !== before.url };
@@ -355,18 +359,79 @@ async function toDataUrl(blob) {
   return 'data:' + blob.type + ';base64,' + btoa(bin);
 }
 
-async function downscale(dataUrl, maxW) {
+function within(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise).finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('screenshot timed out while ' + what)), ms); }),
+  ]);
+}
+
+async function downscale(dataUrl, maxW, format, quality) {
   try {
-    const bmp = await createImageBitmap(await (await fetch(dataUrl)).blob());
-    if (bmp.width <= maxW) return { dataUrl, width: bmp.width, height: bmp.height };
-    const h = Math.round((bmp.height * maxW) / bmp.width);
-    const canvas = new OffscreenCanvas(maxW, h);
-    canvas.getContext('2d').drawImage(bmp, 0, 0, maxW, h);
-    const out = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.7 });
-    return { dataUrl: await toDataUrl(out), width: maxW, height: h };
+    const bmp = await within(createImageBitmap(await (await fetch(dataUrl)).blob()), 10000, 'decoding the image');
+    const width = Math.min(bmp.width, maxW);
+    const height = Math.round((bmp.height * width) / bmp.width);
+    const wanted = format || 'jpeg';
+    if (width === bmp.width && dataUrl.startsWith(`data:image/${wanted};`)) return { dataUrl, width: bmp.width, height: bmp.height };
+    const canvas = new OffscreenCanvas(width, height);
+    canvas.getContext('2d').drawImage(bmp, 0, 0, width, height);
+    const out = await within(canvas.convertToBlob({ type: `image/${wanted}`, quality: (quality || 70) / 100 }), 10000, 'encoding the image');
+    return { dataUrl: await toDataUrl(out), width, height };
   } catch (e) {
+    if (/^screenshot timed out/.test(String(e && e.message))) throw e;
     return { dataUrl };
   }
+}
+
+async function cropImage(dataUrl, box, maxW, format, quality) {
+  const bmp = await within(createImageBitmap(await (await fetch(dataUrl)).blob()), 10000, 'decoding the image');
+  const sx = bmp.width / box.viewportWidth;
+  const sy = bmp.height / box.viewportHeight;
+  const srcX = Math.max(0, Math.round(box.x * sx));
+  const srcY = Math.max(0, Math.round(box.y * sy));
+  const srcW = Math.max(1, Math.min(bmp.width - srcX, Math.round(box.width * sx)));
+  const srcH = Math.max(1, Math.min(bmp.height - srcY, Math.round(box.height * sy)));
+  const width = Math.min(srcW, maxW);
+  const height = Math.max(1, Math.round(srcH * width / srcW));
+  const canvas = new OffscreenCanvas(width, height);
+  canvas.getContext('2d').drawImage(bmp, srcX, srcY, srcW, srcH, 0, 0, width, height);
+  const out = await within(canvas.convertToBlob({ type: `image/${format}`, quality: quality / 100 }), 10000, 'encoding the image');
+  return { dataUrl: await toDataUrl(out), width, height };
+}
+
+async function captureVisible(id, shot) {
+  const t = await api.tabs.get(id);
+  const prev = (await api.tabs.query({ active: true, windowId: t.windowId }))[0];
+  let raised = false;
+  let dataUrl;
+  if (!t.active) { await api.tabs.update(id, { active: true }); await sleep(300); }
+  try {
+    try {
+      dataUrl = await api.tabs.captureVisibleTab(t.windowId, shot);
+    } catch (e) {
+      // A covered or minimised window is not drawn and cannot be captured: bring it forward and retry once.
+      const win = await api.windows.get(t.windowId);
+      const wasMin = win.state === 'minimized';
+      // Windows often refuses a plain focus request; restoring from minimised reliably puts the window on top.
+      if (!wasMin) { try { await api.windows.update(t.windowId, { state: 'minimized' }); await sleep(300); } catch (e3) {} }
+      const back = win.state === 'maximized' || win.state === 'fullscreen' ? win.state : 'normal';
+      await api.windows.update(t.windowId, { state: back });
+      try { await api.windows.update(t.windowId, { focused: true }); } catch (e3) {}
+      raised = true;
+      await sleep(700);
+      try {
+        dataUrl = await api.tabs.captureVisibleTab(t.windowId, shot);
+      } catch (e2) {
+        throw new Error('could not capture the tab; the browser window must be visible on screen (' + String((e2 && e2.message) || e2) + ')');
+      } finally {
+        if (wasMin) { try { await api.windows.update(t.windowId, { state: 'minimized' }); } catch (e3) {} }
+      }
+    }
+  } finally {
+    if (prev && prev.id !== id) { try { await api.tabs.update(prev.id, { active: true }); } catch (e) {} }
+  }
+  return { dataUrl, raised };
 }
 
 // ---- real input on Chrome and Edge, through the debugger ----
@@ -534,6 +599,7 @@ async function cdpMouse(tabId, op, x, y, o) {
   }
   // click
   await send('mouseMoved', { button: 'none' });
+  await sleep(30);
   const n = o.double ? 2 : 1;
   for (let c = 1; c <= n; c++) {
     await send('mousePressed', { button, buttons: BUTTONS[button], clickCount: c });
@@ -553,6 +619,12 @@ function runDialogs(tabId, o) {
 // Real input for click / type / key. Returns null to let the caller fall back to simulated input.
 async function realAct(tabId, p, action) {
   if (action === 'click') {
+    // Attaching the debugger can add Chrome's debugging bar and move the page in a headed window. Attach first,
+    // then locate the element against the settled viewport; otherwise the first click in a new tab can use stale
+    // coordinates and land above the target.
+    const fresh = !cdpTabs.has(tabId);
+    await cdpAttach(tabId);
+    if (fresh) await sleep(150);
     const loc = await locate(tabId, { ref: p.ref, selector: p.selector });
     if (loc.disabled) throw new Error('the element is disabled');
     if (!loc.visible || !loc.reachable) return { fallback: loc.visible ? 'it is covered by ' + loc.cover : 'it has no visible area on screen' };
@@ -890,6 +962,15 @@ if (api.webNavigation) {
 
 // ---- tools ----
 
+async function editTabs(fn) {
+  for (let i = 0; ; i++) {
+    try { return await fn(); } catch (e) {
+      if (i >= 9 || !/tabs cannot be edited right now|dragging a tab/i.test(String((e && e.message) || e))) throw e;
+      await sleep(100);
+    }
+  }
+}
+
 const handlers = {
   async tabs(p) {
     const action = p.action || 'list';
@@ -906,21 +987,29 @@ const handlers = {
       if (p.container) create.cookieStoreId = await containerId(p.container);
       const before = await tabIds();
       let t;
-      pendingNewTabs++;
+      let group = '';
+      pendingNewTabs.push(true);
       try {
         t = await api.tabs.create(create);
       } catch (e) {
-        if (create.cookieStoreId) { pendingNewTabs = Math.max(0, pendingNewTabs - 1); throw e; }
+        if (create.cookieStoreId) { pendingNewTabs.pop(); throw e; }
         const w = await api.windows.create({ url, focused: !!p.active });
         t = w.tabs[0];
       } finally {
         // If a different tab was created at the same moment and got marked by mistake, unmark it.
         for (const x of earlyMarked) if (x !== t?.id) agent.delete(x);
         earlyMarked.clear();
-        pendingNewTabs = 0;
+        pendingNewTabs.pop();
       }
       agent.add(t.id);
       await saveAgentTabs();
+      if (!IS_FIREFOX && api.tabs.group && api.tabGroups) {
+        try {
+          const groupId = await editTabs(() => api.tabs.group({ tabIds: [t.id] }));
+          await editTabs(() => api.tabGroups.update(groupId, { title: 'browzat', color: 'green', collapsed: false }));
+          t.group = group = 'browzat';
+        } catch (e) {}
+      }
       if (url === 'about:blank') return brief(t, agent, null, cmap);
       const timeout = clamp(p.timeout_ms || 30000, 1000, 120000);
       let r;
@@ -937,13 +1026,22 @@ const handlers = {
         r = await waitForLoad(repl.id, timeout, true);
         reopened = true;
       }
-      return brief(r.tab, agent, { timedOut: r.timedOut, reopened }, cmap);
+      return brief(r.tab, agent, { timedOut: r.timedOut, reopened, group }, cmap);
     }
     if (action === 'close') {
       const id = need(p);
       if (!agent.has(id) && !p.force) throw new Error('this tab was not opened by you; close it only if the user asks (force: true)');
       await api.tabs.remove(id);
       return { closed: id };
+    }
+    if (action === 'cleanup') {
+      const ids = [...agent];
+      const alive = [];
+      for (const id of ids) { try { await api.tabs.get(id); alive.push(id); } catch (e) { agent.delete(id); } }
+      if (alive.length) await editTabs(() => api.tabs.remove(alive));
+      for (const id of alive) agent.delete(id);
+      await saveAgentTabs();
+      return { closed: alive };
     }
     if (action === 'activate') {
       const t = await api.tabs.update(need(p), { active: true });
@@ -1081,43 +1179,94 @@ const handlers = {
 
   async screenshot(p) {
     const id = need(p);
+    const format = ['jpeg', 'png', 'webp'].includes(p.format) ? p.format : 'jpeg';
+    const quality = clamp(p.quality || 70, 1, 100);
+    const mode = p.ref || p.selector ? 'element' : p.full_page ? 'full' : 'viewport';
     let dataUrl;
     let raised = false;
-    if (api.tabs.captureTab) {
-      dataUrl = await api.tabs.captureTab(id, { format: 'jpeg', quality: 70 });
+    let desc = '';
+    if (mode === 'element' && HAS_CDP && !p.transparent) {
+      const box = unwrap((await run(id, function (a) {
+        const state = globalThis.__bmcp;
+        const el = a.ref ? state && state.els.get(a.ref) : document.querySelector(a.selector);
+        if (!el || !el.isConnected) throw new Error(a.ref ? 'ref ' + a.ref + ' is no longer on the page; take a new snapshot' : 'selector matched nothing: ' + a.selector);
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        const r = el.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) throw new Error('the element has no visible area');
+        const label = (el.getAttribute('aria-label') || el.innerText || el.id || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+        return { ok: true, value: { x: r.left, y: r.top, width: r.width, height: r.height,
+          viewportWidth: innerWidth, viewportHeight: innerHeight, desc: el.localName + (label ? ' "' + label + '"' : '') } };
+      }, [{ ref: p.ref, selector: p.selector }], { frameId: 0 }))[0]);
+      const visible = await captureVisible(id, { format: 'png' });
+      const cropped = await cropImage(visible.dataUrl, box, clamp(p.max_width || 1280, 320, 8192), format, quality);
+      dataUrl = cropped.dataUrl;
+      raised = visible.raised;
+      desc = box.desc;
+    } else if (mode !== 'viewport' && HAS_CDP) {
+      await cdpPin(id, 'output-screenshot');
+      let clip;
+      if (mode === 'full') {
+        const metrics = await cdp(id, 'Page.getLayoutMetrics');
+        const box = metrics.cssContentSize || metrics.contentSize;
+        clip = { x: 0, y: 0, width: Math.min(box.width, 16384), height: Math.min(box.height, 16384), scale: 1 };
+      } else {
+        const box = unwrap((await run(id, function (a) {
+          const state = globalThis.__bmcp;
+          let el = a.ref ? state && state.els.get(a.ref) : document.querySelector(a.selector);
+          if (!el || !el.isConnected) throw new Error(a.ref ? 'ref ' + a.ref + ' is no longer on the page; take a new snapshot' : 'selector matched nothing: ' + a.selector);
+          el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+          const r = el.getBoundingClientRect();
+          if (r.width < 1 || r.height < 1) throw new Error('the element has no visible area');
+          const label = (el.getAttribute('aria-label') || el.innerText || el.id || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+          return { ok: true, value: { x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height, desc: el.localName + (label ? ' "' + label + '"' : '') } };
+        }, [{ ref: p.ref, selector: p.selector }], { frameId: 0 }))[0]);
+        clip = { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 };
+        desc = box.desc;
+      }
+      try {
+        if (p.transparent) await cdp(id, 'Emulation.setDefaultBackgroundColorOverride', { color: { r: 0, g: 0, b: 0, a: 0 } });
+        // Some Google Chrome builds leave Page.captureScreenshot pending forever when CDP is asked for WebP.
+        // Capture losslessly as PNG and let downscale() do the WebP encoding, as the other capture paths do.
+        const captureFormat = format === 'webp' ? 'png' : format;
+        const shot = { format: captureFormat, captureBeyondViewport: true, fromSurface: true, clip };
+        if (captureFormat !== 'png') shot.quality = quality;
+        const out = await within(cdp(id, 'Page.captureScreenshot', shot), 10000, 'capturing the page');
+        dataUrl = `data:image/${captureFormat};base64,${out.data}`;
+      } finally {
+        if (p.transparent) { try { await cdp(id, 'Emulation.setDefaultBackgroundColorOverride'); } catch (e) {} }
+        cdpUnpin(id, 'output-screenshot');
+        // A second Page.captureScreenshot on the same debugger attachment can remain pending in Google Chrome
+        // after a full-page capture. Screenshots do not benefit from the idle attachment cache, so start the next
+        // one with a fresh session unless another feature (routes, conditions or bodies) still needs this session.
+        if (!cdpPins.has(id)) await cdpDetach(id);
+      }
+    } else if (api.tabs.captureTab) {
+      if (p.transparent) throw new Error('screenshot: transparent is not supported on Firefox');
+      const shot = { format: format === 'webp' ? 'png' : format };
+      if (shot.format === 'jpeg') shot.quality = quality;
+      if (mode !== 'viewport') {
+        const box = unwrap((await run(id, function (a) {
+          if (!a.target) return { ok: true, value: { x: 0, y: 0, width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight } };
+          const state = globalThis.__bmcp;
+          const el = a.ref ? state && state.els.get(a.ref) : document.querySelector(a.selector);
+          if (!el || !el.isConnected) throw new Error(a.ref ? 'ref ' + a.ref + ' is no longer on the page; take a new snapshot' : 'selector matched nothing: ' + a.selector);
+          const r = el.getBoundingClientRect();
+          const label = (el.getAttribute('aria-label') || el.innerText || el.id || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+          return { ok: true, value: { x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height, desc: el.localName + (label ? ' "' + label + '"' : '') } };
+        }, [{ target: mode === 'element', ref: p.ref, selector: p.selector }], { frameId: 0 }))[0]);
+        shot.rect = { x: box.x, y: box.y, width: Math.min(box.width, 16384), height: Math.min(box.height, 16384) };
+        desc = box.desc || '';
+      }
+      dataUrl = await api.tabs.captureTab(id, shot);
     } else {
       // Chromium can only capture the visible tab of a window: show it, capture, then put the user's tab back.
-      const t = await api.tabs.get(id);
-      const prev = (await api.tabs.query({ active: true, windowId: t.windowId }))[0];
-      const shot = { format: 'jpeg', quality: 70 };
-      if (!t.active) { await api.tabs.update(id, { active: true }); await sleep(300); }
-      try {
-        try {
-          dataUrl = await api.tabs.captureVisibleTab(t.windowId, shot);
-        } catch (e) {
-          // A covered or minimised window is not drawn and cannot be captured: bring it forward and retry once.
-          const win = await api.windows.get(t.windowId);
-          const wasMin = win.state === 'minimized';
-          // Windows often refuses a plain focus request; restoring from minimised reliably puts the window on top.
-          if (!wasMin) { try { await api.windows.update(t.windowId, { state: 'minimized' }); await sleep(300); } catch (e3) {} }
-          const back = win.state === 'maximized' || win.state === 'fullscreen' ? win.state : 'normal';
-          await api.windows.update(t.windowId, { state: back });
-          try { await api.windows.update(t.windowId, { focused: true }); } catch (e3) {}
-          raised = true;
-          await sleep(700);
-          try {
-            dataUrl = await api.tabs.captureVisibleTab(t.windowId, shot);
-          } catch (e2) {
-            throw new Error('could not capture the tab; the browser window must be visible on screen (' + String((e2 && e2.message) || e2) + ')');
-          } finally {
-            if (wasMin) { try { await api.windows.update(t.windowId, { state: 'minimized' }); } catch (e3) {} }
-          }
-        }
-      } finally {
-        if (prev && prev.id !== id) { try { await api.tabs.update(prev.id, { active: true }); } catch (e) {} }
-      }
+      const shot = { format: format === 'webp' ? 'png' : format };
+      if (shot.format === 'jpeg') shot.quality = quality;
+      const visible = await captureVisible(id, shot);
+      dataUrl = visible.dataUrl;
+      raised = visible.raised;
     }
-    return Object.assign(await downscale(dataUrl, clamp(p.max_width || 1280, 320, 2560)), { raised });
+    return Object.assign(await downscale(dataUrl, clamp(p.max_width || 1280, 320, 8192), format, quality), { raised, mode, desc });
   },
 };
 
@@ -1152,8 +1301,8 @@ handlers.drag = async (p) => {
       await cdp(id, 'Input.setInterceptDrags', { enabled: true });
       let drag = null;
       let dropped = false;
+      const intercepted = cdpEvent(id, 'Input.dragIntercepted', 2000);
       try {
-        const intercepted = cdpEvent(id, 'Input.dragIntercepted', 2000);
         intercepted.then((d) => { drag = d; });
         await cdpMouse(id, 'move', a.x, a.y);
         await cdpMouse(id, 'down', a.x, a.y);
@@ -1162,8 +1311,9 @@ handlers.drag = async (p) => {
           await cdpMouse(id, 'move', a.x + ((b.x - a.x) * i) / steps, a.y + ((b.y - a.y) * i) / steps);
           await sleep(30);
         }
-        // A fresh or busy browser can report the drag start late: give it up to a second.
-        if (!drag) await Promise.race([intercepted, sleep(1000)]);
+        // A fresh or busy browser can report the drag start late. Use the resolved value directly so cleanup and
+        // fallback do not depend on the timing of the separate .then() callback above.
+        if (!drag) drag = await intercepted;
         if (drag && drag.data) {
           // An HTML5 drag started: the browser handed it to us; replay it over the target and drop it there.
           await cdp(id, 'Input.dispatchDragEvent', { type: 'dragEnter', x: b.x, y: b.y, data: drag.data });
@@ -1172,6 +1322,10 @@ handlers.drag = async (p) => {
           dropped = true;
         } else {
           await cdpMouse(id, 'move', b.x, b.y);
+          await cdpMouse(id, 'up', b.x, b.y);
+          mouseHeld.delete(id);
+          const fallback = unwrap((await run(id, bmcpPointer, [Object.assign({ action: 'drag' }, p)], { frameId: 0 }))[0]);
+          return { done: fallback };
         }
         await cdpMouse(id, 'up', b.x, b.y);
         return { done: 'dragged ' + a.desc + ' onto ' + b.desc + (drag ? ' (HTML5 drag and drop)' : ' (mouse drag)') };
@@ -1184,6 +1338,10 @@ handlers.drag = async (p) => {
           if (late && late.data) { try { await cdp(id, 'Input.dispatchDragEvent', { type: 'dragCancel', x: b.x, y: b.y, data: late.data }); } catch (e) {} }
         }
         try { await cdp(id, 'Input.setInterceptDrags', { enabled: false }); } catch (e) {}
+        // Chromium can keep its internal pointer in drag mode briefly after the command resolves. A neutral move
+        // after disabling interception resets it so the next ordinary coordinate click is not swallowed.
+        try { await cdpMouse(id, 'move', b.x, b.y); } catch (e) {}
+        await sleep(100);
       }
     }
   }

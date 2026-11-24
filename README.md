@@ -108,6 +108,15 @@ agent  ──stdio──>  mcp.js  ──HTTP on 127.0.0.1──>  relay.js  <�
 
 ## Install
 
+From npm after the package is published:
+
+```bash
+npx browzat install
+```
+
+The command installs the server under `~/.mcp-servers/browser-mcp`, installs its production dependency, builds both
+extensions and prints the MCP command and extension paths. Source installs remain available below.
+
 Clone this repository anywhere, then run the installer. Run it again after every `git pull`; it is safe to repeat.
 
 ```bash
@@ -203,6 +212,20 @@ press **Save and connect**. The name then stays with that profile.
 | `network_route` | Block or mock requests by URL pattern; list, remove, clear |
 | `network_conditions` | Chrome and Edge: offline, latency, slow download and upload |
 | `console_messages` | Console output, uncaught errors, unhandled rejections, failed loads |
+| `cookies` | List, get, set, delete or clear cookies for one tab's site and cookie jar |
+| `storage` | List, get, set, delete or clear localStorage or sessionStorage for a tab's origin |
+| `storage_state` | Save one site's cookies and storage to a private JSON file, or restore it |
+| `container` | Firefox: create, list or remove isolated containers made by browzat |
+| `pdf` | Chrome and Edge: save a page as a PDF with print styles, page size, margins and ranges |
+| `emulate` | Viewport, device, user agent, locale, time zone, location, media, CPU and request headers; reset removes them |
+| `performance` | Navigation and paint metrics, Chromium DevTools traces, short visual recordings with an HTML player |
+| `verify` | Assert that an element, text, list or field value is visible |
+| `inspect` | Element text, HTML, attributes, box, locator, styles, or page frames |
+| `fill_form` | Fill several text, choice and checkable fields in one call |
+| `scroll` | Scroll by pixels, to a page edge, or bring an element into view |
+| `highlight` | Show or hide a labelled outline around an element |
+| `audit` | Fast local checks for page titles, language, labels, image alternatives, IDs and link text |
+| `logpoints` | Chrome and Edge: debugger logpoints without editing the site's source |
 
 **Network and console:** requests are recorded in the tabs the agent opened (and in a tab of yours only after the
 agent calls `network_requests` on it), at most the newest 500 per tab, in memory, dropped when the tab closes. URL
@@ -213,7 +236,7 @@ available. The console on Chrome and Edge includes everything since the page sta
 looked; on Firefox it covers pages opened or navigated in agent tabs.
 | `evaluate` | Run JavaScript in the page |
 | `wait_for` | Wait for text or a selector to appear or disappear |
-| `screenshot` | Capture the visible part of a tab |
+| `screenshot` | Capture the visible viewport, full page or one element as JPEG, PNG or WebP |
 | `handoff` | Ask the user to do a step only a person can do (login, 2FA, passkey, captcha, a confirmation), then wait |
 
 **Real input:** on Chrome and Edge, clicks, typing, keys, hover, drag and mouse actions go through the browser's
@@ -238,7 +261,20 @@ refuses to close a tab it did not open unless told to force it. Password field v
 
 **Firefox containers (Multi-Account Containers):** `tabs` with `action: "containers"` lists them, and
 `action: "new"` with `container: "Work"` opens a tab inside one. If the containers add-on reopens a site in its
-assigned container, the tool follows it and returns the new tab.
+assigned container, the tool follows it and returns the new tab. `container` can create a fresh container and remove
+containers it created. Chrome and Edge require a separately paired browser profile for an isolated cookie jar.
+
+**Cookies and storage:** every operation is scoped to the tab's site and its cookie jar. `storage_state` writes login
+secrets in plain text under the browzat `output/` folder with private file permissions. Keep those files private and
+delete them when they are no longer needed. Restoring state affects only the site open in the selected tab.
+
+**Output and emulation:** screenshots can be returned or saved to a new file. PDF output uses Chrome or Edge because
+Firefox extensions can only open a person-facing save dialog. Chromium emulation uses the debugger and stays active
+until reset. Firefox supports request headers and attempts viewport resizing for the whole browser window.
+
+**Performance and checks:** `performance` keeps traces or visual recordings active until their corresponding stop
+action. Recordings are JPEG frames plus a local HTML player. `audit` is a quick local page-quality scan and does not
+send page data to Lighthouse or another service. Chromium logpoints keep the debugger attached until cleared.
 
 ## Day-to-day commands
 
@@ -279,7 +315,13 @@ Full model and how to report a problem: [SECURITY.md](SECURITY.md).
 
 ## Limits
 
-- Clicks and key presses are simulated events, not real input. Most sites accept them; a few do not.
+- Firefox input and input inside iframes is simulated. Most sites accept it; a few require trusted browser input.
+- Storage tools cover cookies, localStorage and sessionStorage for the top page. IndexedDB is reported but is not
+  saved, and storage inside iframes is outside their scope.
+- PDF output is unavailable on Firefox. Some per-tab environment overrides are unavailable there because Firefox has
+  no extension API equivalent to Chromium's debugger emulation commands.
+- DevTools performance traces and logpoints require Chrome or Edge. Firefox supports performance metrics and visual
+  recording.
 - `evaluate` in Chrome and Edge fails on sites whose security policy forbids `eval`. Reading, clicking and typing
   are not affected. In Firefox the code runs in the extension's content-script world; page variables are under
   `window.wrappedJSObject`.
@@ -292,7 +334,22 @@ Full model and how to report a problem: [SECURITY.md](SECURITY.md).
 `npm run check` needs no browser: it checks the syntax of every JavaScript file, parses every JSON file, builds the
 extension and confirms the built manifests carry the package version. CI runs it on every push.
 
-`test/e2e.js` drives a local test page through the real MCP server:
+`test/bed.js` builds the extension and runs end-to-end checks concurrently in fresh browser profiles with a separate
+relay. By default it runs headless on one installed Chromium-family browser and Firefox. Use `--only <group>` for a
+feature section, or `--browsers <list>` to choose browsers.
+
+```bash
+node test/bed.js
+node test/bed.js --browsers edge,firefox --only core
+```
+
+New features can register server tools in `server/tools/` and extension handlers in `extension/src/feat-*.js`.
+Feature tests go in `test/e2e/<nn>-<group>.js` and can run on their own with `--only <group>`.
+
+The npm executable and release process are described in `docs/distribution.md`. `npm run release` builds unsigned
+browser archives and SHA-256 checksums. A version tag runs the release workflow.
+
+`test/e2e.js` drives a local test page through the MCP server against an already paired browser:
 
 ```bash
 node test/e2e.js <browser-id>                 # throwaway profile

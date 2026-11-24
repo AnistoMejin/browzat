@@ -4,8 +4,9 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const C = require('./common');
+const { loadToolModules, mergeTools, TAB } = require('./tool-modules');
+const policyFactory = require('./policy');
 
-const TAB = { type: 'string', description: 'Tab handle returned by tabs, like "firefox:12".' };
 const TOOLS = [
   {
     name: 'status',
@@ -18,7 +19,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'new', 'close', 'activate', 'containers'] },
+        action: { type: 'string', enum: ['list', 'new', 'close', 'activate', 'containers', 'cleanup'] },
         container: { type: 'string', description: 'new, Firefox only: name of the container to open the tab in.' },
         browser: { type: 'string', description: 'firefox, chrome or edge. Needed for new when several browsers are connected.' },
         url: { type: 'string', description: 'new: the page to open.' },
@@ -128,10 +129,16 @@ const TOOLS = [
   },
   {
     name: 'screenshot',
-    description: 'Capture the visible part of a tab as an image. Costs far more than snapshot; use it only when layout or visuals matter.',
+    description: 'Capture a tab as an image: the visible part (default), the whole page (full_page) or one element (ref or selector). The image is returned and saved; with path it is only saved. Costs far more than snapshot.',
     inputSchema: {
       type: 'object',
-      properties: { tab: TAB, max_width: { type: 'number', description: 'Default 1280.' } },
+      properties: {
+        tab: TAB, full_page: { type: 'boolean' }, ref: { type: 'string' }, selector: { type: 'string' },
+        format: { type: 'string', enum: ['jpeg', 'png', 'webp'] }, quality: { type: 'number' },
+        max_width: { type: 'number', description: 'Default 1280.' }, transparent: { type: 'boolean' },
+        path: { type: 'string', description: 'A new .jpg, .png or .webp file. A name is saved inside the output folder.' },
+        timeout_ms: { type: 'number' },
+      },
       required: ['tab'],
     },
   },
@@ -305,6 +312,19 @@ const TOOLS = [
 ];
 const TOOL_NAMES = new Set(TOOLS.map((t) => t.name));
 
+// Feature modules (server/tools/*.js, see the README there) add their tools after the built-in ones.
+let ALL_TOOLS = TOOLS;
+let MODULE_OF = new Map(); // tool name -> the module that runs it
+let startError = null;
+try {
+  ({ tools: ALL_TOOLS, owner: MODULE_OF } = mergeTools(TOOLS, loadToolModules()));
+} catch (e) {
+  startError = e;
+}
+let POLICY;
+try { POLICY = policyFactory.create(ALL_TOOLS, C); } catch (e) { startError = startError || e; }
+const EXPOSED_TOOLS = POLICY ? POLICY.tools : ALL_TOOLS;
+
 const INSTRUCTIONS =
   "Drives the user's own logged-in Firefox, Chrome and Edge through the browzat extension. " +
   'Open a tab with tabs (action new), read it with snapshot, then act on refs like e12 with click and type. ' +
@@ -315,6 +335,13 @@ const INSTRUCTIONS =
 const text = (t) => ({ content: [{ type: 'text', text: String(t) }] });
 const handle = (browser, id) => `${browser}:${id}`;
 
+// "firefox:12" -> { browser: 'firefox', tabId: 12 }; "12" -> { browser: undefined, tabId: 12 }.
+function parseTab(tab) {
+  const m = /^(?:([a-z0-9-]+):)?(\d+)$/i.exec(String(tab).trim());
+  if (!m) throw new Error('tab must look like "firefox:12"');
+  return { browser: m[1] ? m[1].toLowerCase() : undefined, tabId: Number(m[2]) };
+}
+
 function tabLine(browser, t) {
   return `${handle(browser, t.tabId)}${t.container ? ' [' + t.container + ']' : ''}${t.agent ? '' : ' (user tab)'}${t.active ? ' *' : ''}  ${t.title || ''}  ${t.url || ''}`;
 }
@@ -322,6 +349,7 @@ function tabLine(browser, t) {
 function tabInfo(browser, r) {
   return `tab: ${handle(browser, r.tabId)}\nurl: ${r.url || ''}\ntitle: ${r.title || ''}` +
     (r.container ? `\ncontainer: ${r.container}` : '') +
+    (r.group ? `\ngroup: ${r.group}` : '') +
     (r.reopened ? '\nnote: the containers add-on reopened this site in its assigned container; this is the new tab, use this handle' : '') +
     (r.timedOut ? '\nnote: the page was still loading when the wait ended' : '');
 }
@@ -401,26 +429,77 @@ async function listAllTabs(a) {
   return text(lines.join('\n'));
 }
 
+// For feature modules: sends a call to the extension handler `tool` the way the built-in tools do. a.tab
+// ("firefox:12") becomes args.tabId and names the browser; without a tab, a.browser names it. Every other member of a
+// is passed on. opts.tab: false makes the tab optional; opts.waitMs is how long the handler may take (default
+// a.timeout_ms, or 30 s; at most 120 s). Resolves to { browser, result }.
+async function send(tool, a, opts) {
+  a = a || {};
+  opts = opts || {};
+  let browser = a.browser;
+  const args = Object.assign({}, a);
+  delete args.browser;
+  delete args.tab;
+  if (a.tab != null && a.tab !== '') {
+    const t = parseTab(a.tab);
+    if (t.browser) browser = t.browser;
+    args.tabId = t.tabId;
+  } else if (opts.tab !== false) {
+    throw new Error('tab is required');
+  }
+  const wait = Math.min(Math.max(Number(opts.waitMs != null ? opts.waitMs : a.timeout_ms || a.time_ms) || 30000, 1000), 120000);
+  const out = await relayCall('call', { browser, tool, args, timeoutMs: wait + 15000 }, wait + 60000);
+  return { browser: out.browser, result: out.result || {} };
+}
+
+// What a feature module's run(name, args, h) gets as h.
+const H = { C, TAB, text, handle, parseTab, tabInfo, tabLine, fmtDialogs, relayCall, send };
+
 async function runTool(name, a) {
+  const mod = MODULE_OF.get(name);
+  if (mod) {
+    const res = await mod.run(name, a, H);
+    if (typeof res === 'string') return text(res);
+    if (!res || !Array.isArray(res.content)) throw new Error(`${mod.file}: run("${name}") must return h.text(...), a string or an MCP result with content`);
+    return res;
+  }
   if (!TOOL_NAMES.has(name)) throw new Error('unknown tool ' + name);
   if (name === 'status') return text(fmtStatus(await relayCall('status', {}, 10000)));
   if (name === 'tabs' && (a.action || 'list') === 'list' && !a.browser) return listAllTabs(a);
 
   let browser = a.browser;
+  let screenshotFile = '';
   if (!browser && name === 'tabs' && (a.action === 'containers' || a.container)) browser = 'firefox'; // containers are a Firefox feature
   const args = Object.assign({}, a);
   delete args.browser;
   delete args.tab;
   if (a.tab != null && a.tab !== '') {
-    const m = /^(?:([a-z0-9-]+):)?(\d+)$/i.exec(String(a.tab).trim());
-    if (!m) throw new Error('tab must look like "firefox:12"');
-    if (m[1]) browser = m[1].toLowerCase();
-    args.tabId = Number(m[2]);
+    const t = parseTab(a.tab);
+    if (t.browser) browser = t.browser;
+    args.tabId = t.tabId;
   } else if (name !== 'tabs' || a.action === 'close' || a.action === 'activate') {
     throw new Error('tab is required');
   }
 
   if (name === 'upload') args.files = await uploadFiles(a.files, browser);
+  if (name === 'screenshot') {
+    if (a.full_page && (a.ref || a.selector)) throw new Error('full_page cannot be combined with ref or selector: capture the whole page or one element');
+    let format = a.format || '';
+    if (a.path) {
+      screenshotFile = path.isAbsolute(a.path) ? path.resolve(a.path) : path.join(C.OUTPUT_DIR, a.path);
+      const ext = path.extname(screenshotFile).toLowerCase();
+      const byExt = ext === '.jpg' || ext === '.jpeg' ? 'jpeg' : ext === '.png' ? 'png' : ext === '.webp' ? 'webp' : '';
+      if (!byExt) throw new Error('path must end with .jpg, .jpeg, .png or .webp');
+      if (format && format !== byExt) throw new Error(`path ends with ${ext} but format is ${format}; make them agree or leave format out`);
+      format = byExt;
+      if (fs.existsSync(screenshotFile)) throw new Error('the output file already exists; choose a new path');
+    }
+    format = format || 'jpeg';
+    if (!['jpeg', 'png', 'webp'].includes(format)) throw new Error('format must be jpeg, png or webp');
+    const quality = a.quality == null ? 70 : Number(a.quality);
+    if (!Number.isFinite(quality) || quality < 1 || quality > 100) throw new Error('quality must be a number from 1 to 100');
+    Object.assign(args, { format, quality, max_width: Math.min(Math.max(Number(a.max_width) || 1280, 320), 8192), transparent: !!a.transparent && format !== 'jpeg' });
+  }
 
   const wait = name === 'handoff'
     ? Math.min(Math.max((Number(a.timeout_s) || 300) * 1000, 10000), 600000)
@@ -432,6 +511,7 @@ async function runTool(name, a) {
   switch (name) {
     case 'tabs':
       if (a.action === 'new') return text(tabInfo(b, r));
+      if (a.action === 'cleanup') return text(r.closed.length ? `closed ${r.closed.length} tab(s): ${r.closed.map((id) => handle(b, id)).join(', ')}` : 'you have no open tabs from this session');
       if (a.action === 'close') return text(`closed ${handle(b, r.closed)}`);
       if (a.action === 'activate') return text(`focused ${handle(b, r.tabId)}`);
       if (a.action === 'containers') return text(r.containers.length ? `containers in ${b}: ${r.containers.join(', ')}` : `no containers are defined in ${b}`);
@@ -465,18 +545,20 @@ async function runTool(name, a) {
     case 'screenshot': {
       const m = /^data:(image\/\w+);base64,(.+)$/s.exec(r.dataUrl || '');
       if (!m) throw new Error('the browser returned no image');
-      fs.mkdirSync(C.OUTPUT_DIR, { recursive: true });
-      const file = path.join(C.OUTPUT_DIR, `shot-${Date.now()}.${m[1] === 'image/png' ? 'png' : 'jpg'}`);
-      fs.writeFileSync(file, Buffer.from(m[2], 'base64'));
+      const ext = m[1] === 'image/png' ? 'png' : m[1] === 'image/webp' ? 'webp' : 'jpg';
+      const file = screenshotFile || path.join(C.OUTPUT_DIR, `shot-${Date.now()}.${ext}`);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const image = Buffer.from(m[2], 'base64');
+      fs.writeFileSync(file, image, { flag: 'wx', mode: 0o600 });
+      const detail = r.mode === 'full' ? ', full page' : r.desc ? ', ' + r.desc : '';
+      const result = {
+        type: 'text',
+        text: `saved: ${file}${r.width ? ` (${r.width}x${r.height}${detail}, ${Math.max(1, Math.round(image.length / 1024))} KB)` : ''}` +
+          (r.raised ? '\nnote: the browser window was covered or minimised, so it was brought to the front to capture it' : '') +
+          (a.transparent && a.format === 'jpeg' ? '\nnote: transparent needs png or webp; it was ignored for jpeg' : ''),
+      };
       return {
-        content: [
-          { type: 'image', data: m[2], mimeType: m[1] },
-          {
-            type: 'text',
-            text: `saved: ${file}${r.width ? ` (${r.width}x${r.height})` : ''}` +
-              (r.raised ? '\nnote: the browser window was covered or minimised, so it was brought to the front to capture it' : ''),
-          },
-        ],
+        content: screenshotFile ? [result] : [{ type: 'image', data: m[2], mimeType: m[1] }, result],
       };
     }
     case 'network_requests': {
@@ -556,11 +638,18 @@ async function onMessage(msg) {
       });
     }
     if (method === 'ping') return reply(id, {});
-    if (method === 'tools/list') return reply(id, { tools: TOOLS });
+    if (method === 'tools/list') return reply(id, { tools: EXPOSED_TOOLS });
     if (method === 'tools/call') {
+      const name = params && params.name;
+      const args = (params && params.arguments) || {};
+      const started = Date.now();
       try {
-        return reply(id, await runTool(params && params.name, (params && params.arguments) || {}));
+        if (POLICY) POLICY.before(name, args);
+        const result = await runTool(name, args);
+        if (POLICY) { POLICY.record(name, args, started, result); POLICY.shape(result); }
+        return reply(id, result);
       } catch (e) {
+        if (POLICY) POLICY.record(name, args, started, null, e);
         return reply(id, { content: [{ type: 'text', text: 'Error: ' + String((e && e.message) || e) }], isError: true });
       }
     }
@@ -570,15 +659,25 @@ async function onMessage(msg) {
   }
 }
 
-const rl = readline.createInterface({ input: process.stdin });
-rl.on('line', (line) => {
-  line = line.trim();
-  if (!line) return;
-  let msg;
-  try { msg = JSON.parse(line); } catch { return; }
-  onMessage(msg);
-});
-rl.on('close', () => process.exit(0));
+// Run as a program (the normal case) this is the MCP server. Loaded with require() it only hands out its tool list,
+// for test/check.js, and starts nothing.
+if (require.main === module) {
+  if (startError) {
+    process.stderr.write('browser-mcp: cannot start: ' + startError.message + '\n');
+    process.exit(1);
+  }
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on('line', (line) => {
+    line = line.trim();
+    if (!line) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+    onMessage(msg);
+  });
+  rl.on('close', () => process.exit(0));
 
-// Start the relay early so the extensions are connected before the first tool call.
-C.ensureRelay().catch(() => {});
+  // Start the relay early so the extensions are connected before the first tool call.
+  C.ensureRelay().catch(() => {});
+}
+
+module.exports = { BUILTIN_TOOLS: TOOLS, TOOLS: ALL_TOOLS, EXPOSED_TOOLS, startError, h: H };

@@ -4,20 +4,28 @@
 //   node test/launch-firefox.js <profileDir> <extensionDir> [startUrl]
 const { spawn } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 
 const FIREFOX = process.env.FIREFOX_BIN || 'C:\\Program Files\\Mozilla Firefox\\firefox.exe';
 const [profile, extDir, startUrl] = process.argv.slice(2);
-const PORT = 9334;
+// No fixed port: with port 0 Firefox picks a free one and writes it to WebDriverBiDiServer.json in the profile.
+// BIDI_PORT=<n> asks for a certain port.
+const WANT_PORT = Number(process.env.BIDI_PORT) || 0;
+const portFile = path.join(profile, 'WebDriverBiDiServer.json');
 fs.mkdirSync(profile, { recursive: true });
+try { fs.unlinkSync(portFile); } catch (e) {} // left by an earlier run with this profile
 
-const ff = spawn(FIREFOX, ['--profile', profile, '--no-remote', '--remote-debugging-port', String(PORT), 'about:blank'], { stdio: 'ignore' });
+const ff = spawn(FIREFOX, ['--profile', profile, '--no-remote', '--remote-debugging-port', String(WANT_PORT), 'about:blank'], { stdio: 'ignore' });
 ff.on('exit', (c) => { console.log('firefox exited ' + c); process.exit(0); });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function open() {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/session`);
+    let port = WANT_PORT;
+    if (!port) { try { port = JSON.parse(fs.readFileSync(portFile, 'utf8')).ws_port; } catch (e) {} }
+    if (!port) { reject(new Error('not ready')); return; }
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/session`);
     ws.onopen = () => resolve(ws);
     ws.onerror = () => reject(new Error('not ready'));
   });

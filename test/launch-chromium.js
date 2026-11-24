@@ -3,10 +3,22 @@
 // reports the state of the extension's service worker over the DevTools protocol, then opens a start URL.
 //   node test/launch-chromium.js <browserExe> <profileDir> <extensionDir> [startUrl]
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 const [exe, profile, extDir, startUrl] = process.argv.slice(2);
-const PORT = Number(process.env.CDP_PORT) || 9335;
+// No fixed port: with port 0 the browser picks a free one and writes it to DevToolsActivePort in the profile.
+// CDP_PORT=<n> asks for a certain port.
+const WANT_PORT = Number(process.env.CDP_PORT) || 0;
+const portFile = path.join(profile, 'DevToolsActivePort');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+fs.mkdirSync(profile, { recursive: true });
+try { fs.unlinkSync(portFile); } catch (e) {} // left by an earlier run with this profile
+
+function debugPort() {
+  if (WANT_PORT) return WANT_PORT;
+  try { return Number(fs.readFileSync(portFile, 'utf8').split('\n')[0]) || 0; } catch (e) { return 0; }
+}
 
 const child = spawn(exe, [
   `--user-data-dir=${profile}`,
@@ -14,7 +26,7 @@ const child = spawn(exe, [
   '--no-default-browser-check',
   '--disable-features=DisableLoadExtensionCommandLineSwitch',
   `--load-extension=${extDir}`,
-  `--remote-debugging-port=${PORT}`,
+  `--remote-debugging-port=${WANT_PORT}`,
   // Extra flags, for example CHROME_EXTRA_ARGS=--no-sandbox for a test build on Ubuntu 23.10+, where AppArmor
   // blocks the sandbox of browsers that are not installed as system packages. Throwaway test profiles only.
   ...String(process.env.CHROME_EXTRA_ARGS || '').split(/\s+/).filter(Boolean),
@@ -23,7 +35,9 @@ const child = spawn(exe, [
 child.on('exit', (c) => { console.log('browser exited ' + c); process.exit(0); });
 
 async function targets() {
-  try { return await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json(); } catch (e) { return null; }
+  const port = debugPort();
+  if (!port) return null;
+  try { return await (await fetch(`http://127.0.0.1:${port}/json/list`)).json(); } catch (e) { return null; }
 }
 
 function evalIn(wsUrl, expression) {
@@ -65,7 +79,7 @@ async function worker() {
   console.log('before pairing: ' + (await evalIn(sw.webSocketDebuggerUrl, PROBE)));
 
   if (startUrl) {
-    await fetch(`http://127.0.0.1:${PORT}/json/new?${encodeURIComponent(startUrl)}`, { method: 'PUT' });
+    await fetch(`http://127.0.0.1:${debugPort()}/json/new?${encodeURIComponent(startUrl)}`, { method: 'PUT' });
     console.log('opened start url');
     await sleep(5000);
     sw = (await worker()) || sw;
