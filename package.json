@@ -1,6 +1,6 @@
 {
   "name": "browzat",
-  "version": "0.10.0",
+  "version": "1.0.0",
   "description": "Local-first Browser MCP server and extension for AI agents to automate logged-in Chrome, Edge and Firefox profiles.",
   "keywords": [
     "browser-mcp",

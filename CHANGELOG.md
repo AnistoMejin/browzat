@@ -5,8 +5,15 @@ the version in `package.json` is also the extension version.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-24
+
+First stable browzat release. It promotes the verified cross-browser MCP server, local relay and browser extensions
+from the 0.x roadmap to a stable public package and GitHub release.
+
 - Improved GitHub and npm discoverability with a descriptive Browser MCP title, search-focused package metadata,
   a public-facing feature summary, common use cases and accurate repository/package details.
+- Added a 1280x640 GitHub social preview and prepared the public repository, release archives and npm package for
+  stable distribution.
 
 ## [0.10.0] - 2026-11-24
 
