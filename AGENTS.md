@@ -17,6 +17,7 @@ Run multi-browser verification in pairs when all-browser concurrency creates loc
 - The locally loaded Chrome extension and relay are paired on port 19789 at version 0.10.0. The unpacked extension path is `C:\Entelegen\Projects\browser-mcp\dist\chromium`.
 - Headed Chromium-family input waits for debugger UI layout changes before locating the first click target, resets the pointer after drag interception, retries transient tab-edit busy errors, and records a final visual frame on stop.
 - Release archive generation and `npm pack --dry-run` pass. Generated `release/` files are ignored because tag CI rebuilds and attaches them.
+- GitHub/npm SEO uses the descriptive Browser MCP title and summary, focused discovery keywords/topics, an early quick-start, public feature/use-case copy and accurate repository metadata.
 
 ## Pending verification
 

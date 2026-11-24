@@ -5,6 +5,9 @@ the version in `package.json` is also the extension version.
 
 ## [Unreleased]
 
+- Improved GitHub and npm discoverability with a descriptive Browser MCP title, search-focused package metadata,
+  a public-facing feature summary, common use cases and accurate repository/package details.
+
 ## [0.10.0] - 2026-11-24
 
 Phase 7 of the all-in-one roadmap: agent comfort, tool policies and distribution preparation.

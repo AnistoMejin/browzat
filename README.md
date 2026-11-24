@@ -1,10 +1,57 @@
-<p align="center"><img src="assets/logo.svg" width="96" height="96" alt="browzat logo"></p>
+<p align="center"><img src="assets/logo.svg" width="96" height="96" alt="browzat Browser MCP logo"></p>
 
-# browzat
+# browzat — Browser MCP for Chrome, Edge and Firefox
 
-Lets an AI agent (Claude Code or any other MCP client) drive **your own, logged-in browser profiles** in
-Chrome, Edge and Firefox. Nothing is launched in a clean profile: the agent works in the browser you already
-use, with your sessions, and you can watch it.
+**browzat is a local-first Browser MCP server and browser extension for AI agents.** It lets Claude Code and other
+Model Context Protocol (MCP) clients automate your real, logged-in Chrome, Microsoft Edge and Firefox profiles.
+Nothing is launched in a disposable clean profile: the agent works in the browser you already use, with your active
+sessions, and you can watch every action.
+
+Use browzat for authenticated browser automation, web app testing, form filling, screenshots, PDFs, console and
+network debugging, performance traces, cookie and storage workflows, and human handoffs for logins or sensitive
+steps. The relay stays on your computer and listens only on `127.0.0.1`.
+
+## Why browzat?
+
+- **Use your existing login sessions.** Work with sites where you are already signed in instead of rebuilding state
+  in a temporary automation profile.
+- **One Browser MCP for Chrome, Edge and Firefox.** Drive multiple browsers and profiles from the same local MCP
+  server and shared extension codebase.
+- **Trusted browser input.** Chrome and Edge clicks, typing, keys, hover and drag use the DevTools protocol; Firefox
+  uses the best available extension APIs.
+- **Developer-grade diagnostics.** Inspect page accessibility snapshots, requests, response bodies, console errors,
+  storage, screenshots, PDFs, performance metrics, traces and local audits.
+- **Local-first control.** Pairing tokens, browser traffic and saved output remain local unless the website or MCP
+  client you choose sends data elsewhere.
+- **Human handoff when automation should pause.** Show a secure in-page card for login, CAPTCHA or approval steps,
+  then continue after the user responds.
+
+## Quick start
+
+```bash
+npx browzat install
+```
+
+Then load the generated extension in Chrome, Edge or Firefox, pair the browser, and connect your MCP client. See
+[Install](#install) for source installs and platform-specific steps.
+
+## Browser automation capabilities
+
+| Category | MCP tools and workflows |
+|---|---|
+| Browser control | Open, list, focus, navigate, group and safely clean up agent-created tabs |
+| Page interaction | Accessibility snapshots, click, type, keyboard, hover, drag, mouse, upload and wait |
+| Debugging | Console messages, network requests and bodies, request routing, offline and throttled network modes |
+| Output | Viewport, full-page and element screenshots; printable PDFs on Chrome and Edge |
+| State | Cookies, local storage, session storage, storage-state save/restore and Firefox containers |
+| Quality | Form filling, assertions, element inspection, highlighting, audits, performance metrics and traces |
+
+## Common use cases
+
+- Let an MCP-compatible AI agent work inside authenticated admin panels, dashboards and internal tools.
+- Test a web application across Chrome, Edge and Firefox without recreating the user's browser state.
+- Investigate failed requests, JavaScript errors, slow pages and visual regressions from one MCP workflow.
+- Automate repetitive browser tasks while keeping sensitive login and approval steps under human control.
 
 The project is published as **browzat**, and the extension shows that name and logo in the browser. Inside the code
 it still uses its working name **Browser MCP** (`browser-mcp`): the folders, the MCP entry, the Firefox add-on id and
@@ -15,12 +62,12 @@ to the other.
 
 | What | Name or path |
 |---|---|
-| GitHub repository | `https://github.com/AnistoMejin/browzat` (private) |
+| GitHub repository | `https://github.com/AnistoMejin/browzat` (public) |
 | Source folder (clone, edit, commit here) | anywhere; on the original PC `C:\Entelegen\Projects\browser-mcp` |
 | Install folder (what the browsers and the agent load) | Windows `%USERPROFILE%\.mcp-servers\browser-mcp`, Linux `~/browser-mcp` |
 | Data folder (pairing token, `relay.log`, screenshots) | `~/.browser-mcp` (`%USERPROFILE%\.browser-mcp` on Windows) |
 | MCP server name in Claude Code | `browser-mcp` (user level); tools appear as `mcp__browser-mcp__<tool>` |
-| npm package name | `browser-mcp` (`package.json`, private, not published) |
+| npm package name | `browzat` |
 | Extension name in the browser | **browzat** (was Browser MCP Bridge before 0.3.0); Firefox add-on id `browser-mcp-bridge@local` |
 | Logo | `assets/logo.svg`; icons in `extension/icons/`, drawn by `assets/make-icons.py` |
 | Relay address | `127.0.0.1:19789` |
@@ -65,7 +112,7 @@ browzat/                         (source folder; the repository root)
 │   └── src/
 │       ├── core.js              background logic: connect to the relay, pairing, run the tools it sends
 │       ├── page.js              functions injected into web pages: snapshot, click, type, keys, wait
-│       ├── sw.js                Chrome/Edge service-worker entry; loads page.js and core.js
+│       ├── feat-*.js            modular storage, output, performance and quality-check features
 │       ├── early.js             Firefox: starts the console recorder with each page, removes it from non-agent tabs
 │       ├── popup.html           toolbar popup: profile name, relay port, manual token, Save and connect, Unpair
 │       └── popup.js
@@ -83,7 +130,7 @@ browzat/                         (source folder; the repository root)
 
 Not in the source folder, made by the installer in the install folder:
   node_modules/                  the ws dependency (npm install)
-  dist/chromium/, dist/firefox/  the built extensions that the browsers load (extension/build.js)
+  dist/chromium/, dist/firefox/  built extensions; build.js generates the Chromium sw.js entry point
 ```
 
 ## How it works
